@@ -703,7 +703,7 @@ class PatchFileTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="paseo-compat-offline-")
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name) / "space ' quote $literal"
+        self.base = Path(self.temp.name).resolve() / "space ' quote $literal"
         self.modules = self.base / "prefix/lib/node_modules"
         self.cli = self.modules / "@getpaseo/cli"
         self.manifest(self.cli, "@getpaseo/cli")

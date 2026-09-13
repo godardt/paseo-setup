@@ -1,12 +1,13 @@
 """Offline regressions for argument boundaries, login verification, and locks."""
 
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import claude_codex as runtime
@@ -75,6 +76,267 @@ class ArgumentBoundaryTests(unittest.TestCase):
     def test_native_missing_operand_is_not_filled_by_normalized_effort(self):
         with self.assertRaisesRegex(runtime.SetupError, "--system-prompt needs a value"):
             runtime.parse_launch_args(["--reasoning=ultracode", "--system-prompt"], "high")
+
+
+class PlaneMcpArgumentTests(unittest.TestCase):
+    PATH = "/private/config with spaces/plane-mcp.json"
+    MODEL_ARGS = ["--model", runtime.model_id("high")]
+
+    def setUp(self):
+        self.settings = {"plane_mcp_config": self.PATH}
+        for target, name in ((runtime, "read_json"), (Path, "open")):
+            reader = patch.object(target, name, side_effect=AssertionError("MCP files must stay opaque"))
+            reader.start()
+            self.addCleanup(reader.stop)
+
+    def assert_applied(self, original, expected):
+        # The helper's contract is normalized launch args, not raw positional prompts.
+        args, _ = runtime.parse_launch_args(original, "high")
+        before = list(args)
+        result = runtime.apply_plane_mcp(args, self.settings)
+        self.assertEqual(result, expected)
+        self.assertEqual(args, before)
+        self.assertEqual(runtime.apply_plane_mcp(result, self.settings), result)
+
+    def test_unconfigured_is_unchanged(self):
+        args = [*self.MODEL_ARGS, "--mcp-config", "caller.json", "-p", "Hi"]
+        for settings in ({}, {"plane_mcp_config": None}, {"plane_mcp_config": ""}):
+            with self.subTest(settings=settings):
+                self.assertIs(runtime.apply_plane_mcp(args, settings), args)
+
+    def test_new_group_is_bounded_by_normalized_model(self):
+        for original in ([], ["Hello"], ["-p", "Hi"],
+                         ["--", "--mcp-config", self.PATH, "--strict-mcp-config"]):
+            with self.subTest(original=original):
+                self.assert_applied(original, ["--mcp-config", self.PATH, *self.MODEL_ARGS, *original])
+
+    def test_existing_groups_preserve_all_file_and_json_operands(self):
+        inline = '{ "mcpServers": {"caller": {"command": "unchanged"}} }'
+        for group in (["--mcp-config", "caller.json"],
+                      ["--mcp-config", inline, "other config.json", "-"],
+                      ["--mcp-config=caller.json"],
+                      ["--mcp-config=" + inline, "other config.json", "-"],
+                      ["--mcp-config=", "other.json"]):
+            for after in ([], ["-p", "Hi"], ["--", "literal prompt"]):
+                with self.subTest(group=group, after=after):
+                    self.assert_applied([*group, *after], [*self.MODEL_ARGS, *group, self.PATH, *after])
+
+    def test_append_to_last_group_without_repeating_the_flag(self):
+        first = ["--mcp-config=first.json", "second.json", "--verbose"]
+        for last in (["--mcp-config", "third.json", "fourth.json"],
+                     ["--mcp-config=third.json", "fourth.json"]):
+            with self.subTest(last=last):
+                self.assert_applied([*first, *last, "-p", "Hi"],
+                                    [*self.MODEL_ARGS, *first, *last, self.PATH, "-p", "Hi"])
+
+    def test_exact_managed_operand_in_any_group_is_not_duplicated(self):
+        for group in (["--mcp-config", self.PATH, "caller.json"],
+                      ["--mcp-config", "caller.json", self.PATH],
+                      ["--mcp-config=" + self.PATH, "caller.json"],
+                      ["--mcp-config=caller.json", self.PATH]):
+            for other in ([], ["--verbose", "--mcp-config", "last.json"]):
+                with self.subTest(group=group, other=other):
+                    original = [*group, *other, "-p", "Hi"]
+                    self.assert_applied(original, [*self.MODEL_ARGS, *original])
+
+    def test_only_exact_config_operands_count_as_already_managed(self):
+        for original in (["--append-system-prompt", self.PATH], ["--tools", self.PATH],
+                         ["-p", self.PATH], ["--", self.PATH]):
+            with self.subTest(original=original):
+                self.assert_applied(original, ["--mcp-config", self.PATH, *self.MODEL_ARGS, *original])
+        for operand in (self.PATH + ".other", json.dumps({"path": self.PATH})):
+            with self.subTest(operand=operand):
+                original = ["--mcp-config", operand]
+                self.assert_applied(original, [*self.MODEL_ARGS, *original, self.PATH])
+
+    def test_genuine_strict_option_always_opts_out(self):
+        for strict in ("--strict-mcp-config", "--strict-mcp-config=true", "--strict-mcp-config=false"):
+            for original in ([strict, "-p", "Hi"],
+                             ["--mcp-config", "caller.json", strict, "-p", "Hi"],
+                             [strict, "--mcp-config=caller.json", "other.json"]):
+                with self.subTest(original=original):
+                    self.assert_applied(original, [*self.MODEL_ARGS, *original])
+
+    def test_required_flag_looking_operands_are_not_options(self):
+        for option in sorted(runtime.CLAUDE_VALUE_OPTIONS - {"--mcp-config"}):
+            for operand in ("--strict-mcp-config", "--mcp-config", "--"):
+                with self.subTest(option=option, operand=operand):
+                    original = [option, operand, "--verbose", "-p", "Hi"]
+                    self.assert_applied(original, ["--mcp-config", self.PATH, *self.MODEL_ARGS, *original])
+        # Normalization moves native --effort to the end; its value is still opaque.
+        self.assert_applied(["--effort", "--strict-mcp-config", "-p", "Hi"],
+                            ["--mcp-config", self.PATH, *self.MODEL_ARGS,
+                             "-p", "Hi", "--effort", "--strict-mcp-config"])
+
+    def test_variadic_config_first_operand_can_look_like_a_flag_or_separator(self):
+        for operand in ("--strict-mcp-config", "--mcp-config", "--", ""):
+            for group in (["--mcp-config", operand, "another.json", "-"],
+                          ["--mcp-config=" + operand, "another.json", "-"]):
+                with self.subTest(group=group):
+                    self.assert_applied([*group, "--", "--strict-mcp-config"],
+                                        [*self.MODEL_ARGS, *group, self.PATH, "--", "--strict-mcp-config"])
+
+    def test_required_separator_operand_does_not_hide_later_options(self):
+        for option in sorted(runtime.CLAUDE_VALUE_OPTIONS):
+            with self.subTest(option=option):
+                original = [option, "--", "--mcp-config", "caller.json"]
+                self.assert_applied(original, [*self.MODEL_ARGS, *original, self.PATH])
+                self.assert_applied([*original, "--strict-mcp-config"],
+                                    [*self.MODEL_ARGS, *original, "--strict-mcp-config"])
+
+    def test_optional_and_variadic_boundaries_leave_real_flags_visible(self):
+        for option in sorted(runtime.CLAUDE_OPTIONAL_VALUE_OPTIONS):
+            for operand in ([], ["filter"], ["-"], [""]):
+                with self.subTest(option=option, operand=operand):
+                    original = [option, *operand, "--mcp-config", "caller.json"]
+                    self.assert_applied(original, [*self.MODEL_ARGS, *original, self.PATH])
+                    self.assert_applied([*original, "--strict-mcp-config"],
+                                        [*self.MODEL_ARGS, *original, "--strict-mcp-config"])
+            original = [option + "=--strict-mcp-config", "-p", "Hi"]
+            self.assert_applied(original, ["--mcp-config", self.PATH, *self.MODEL_ARGS, *original])
+        for option in sorted(runtime.CLAUDE_VARIADIC_OPTIONS - {"--mcp-config"}):
+            with self.subTest(option=option):
+                original = [option + "=first", "second", "-", "--mcp-config", "caller.json"]
+                self.assert_applied(original, [*self.MODEL_ARGS, *original, self.PATH])
+                self.assert_applied([*original, "--strict-mcp-config"],
+                                    [*self.MODEL_ARGS, *original, "--strict-mcp-config"])
+
+
+class PlaneMcpLaunchTests(unittest.TestCase):
+    MODES = ("terminal", "paseo", "paseo-stream")
+
+    def setUp(self):
+        self.settings = {
+            "config_dir": "/unused/config", "state_dir": "/unused/state", "port": 8317,
+            "api_key": "fixture-proxy-key", "claude_bin": "/unused/claude", "reasoning": "high",
+            "plane_mcp_config": PlaneMcpArgumentTests.PATH,
+        }
+        self.source = {"PATH": "/unused/bin", "HOME": "/unused/home",
+                       "PLANE_API_KEY": "fixture-plane-token", "ANTHROPIC_API_KEY": "fixture-old-key",
+                       "CLAUDE_CODE_EFFORT_LEVEL": "max", "CLAUDE_CONFIG_DIR": "/unused/daemon-profile"}
+        for attribute, target, name, options in (
+            ("factory", runtime, "Runtime", {"autospec": True}),
+            ("execve", runtime.os, "execve", {"side_effect": SystemExit(0)}),
+            ("stream", runtime, "run_paseo_stream", {"return_value": 0}),
+            ("adopt", runtime, "adopt_isolated_transcript", {}),
+            ("read_json", runtime, "read_json", {"side_effect": AssertionError("No credential reads")}),
+            ("open", Path, "open", {"side_effect": AssertionError("No config reads")}),
+        ):
+            patcher = patch.object(target, name, **options)
+            setattr(self, attribute, patcher.start())
+            self.addCleanup(patcher.stop)
+        self.factory.return_value.has_login.return_value = True
+
+    def mode_args(self, args, mode):
+        return ["--output-format", "stream-json", *args] if mode == "paseo-stream" else args
+
+    def intercepted_launch(self, args, mode, settings=None, auto=False):
+        for mocked in (self.factory, self.execve, self.stream, self.adopt):
+            mocked.reset_mock()
+        source = dict(self.source)
+        if mode != "terminal":
+            source["CLAUDE_CODEX_PASEO_USAGE"] = "1"
+        if auto:
+            source[runtime.AUTO_MODE_OVERRIDE] = "1"
+        with patch.dict(os.environ, source, clear=True), self.assertRaises(SystemExit) as exited:
+            runtime.launch(self.settings if settings is None else settings, self.mode_args(args, mode))
+        self.assertEqual(exited.exception.code, 0)
+        if mode == "paseo-stream":
+            self.execve.assert_not_called()
+            self.stream.assert_called_once()
+            binary, forwarded, env = self.stream.call_args.args
+        else:
+            self.stream.assert_not_called()
+            self.execve.assert_called_once()
+            binary, argv, env = self.execve.call_args.args
+            self.assertEqual(argv[0], binary)
+            forwarded = argv[1:]
+        self.assertEqual(binary, self.settings["claude_bin"])
+        for name in ("PLANE_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_CODE_EFFORT_LEVEL"):
+            self.assertNotIn(name, env)
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/unused/config/claude" if mode == "terminal"
+                         else "/unused/daemon-profile")
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], self.settings["api_key"])
+        return forwarded, env
+
+    def test_launch_preserves_models_settings_and_caller_mcp_configs(self):
+        args = ["--model", runtime.ULTRACODE_MODEL, "--settings=" + json.dumps({"fastMode": True}),
+                "--mcp-config", '{ "mcpServers": {} }', "caller config.json", "-p", "Hi"]
+        for mode in self.MODES:
+            for auto in (False, True):
+                with self.subTest(mode=mode, auto=auto):
+                    forwarded, env = self.intercepted_launch(args, mode, auto=auto)
+                    expected, _ = runtime.parse_launch_args(self.mode_args(args, mode), "high")
+                    if not auto:
+                        expected = runtime.apply_launcher_settings(expected)
+                    end = expected.index("caller config.json") + 1
+                    expected.insert(end, self.settings["plane_mcp_config"])
+                    self.assertEqual(forwarded, expected)
+                    self.assertEqual(env["ANTHROPIC_MODEL"], runtime.ULTRACODE_MODEL)
+                    self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], runtime.ULTRACODE_MODEL)
+                    self.factory.assert_called_once_with(self.settings)
+                    self.factory.return_value.has_login.assert_called_once_with()
+                    self.factory.return_value.start.assert_called_once_with()
+                    if mode == "terminal":
+                        self.adopt.assert_not_called()
+                    else:
+                        self.adopt.assert_called_once_with(self.settings, forwarded, env)
+
+    def test_launch_prepends_new_group_before_model_not_positional_prompt(self):
+        for mode in self.MODES:
+            for auto in (False, True):
+                with self.subTest(mode=mode, auto=auto):
+                    forwarded, _ = self.intercepted_launch(["Hello"], mode, auto=auto)
+                    expected, _ = runtime.parse_launch_args(self.mode_args(["Hello"], mode), "high")
+                    if not auto:
+                        expected = runtime.apply_launcher_settings(expected)
+                    self.assertEqual(forwarded, ["--mcp-config", self.settings["plane_mcp_config"], *expected])
+
+    def test_injection_runs_after_settings_and_before_runtime(self):
+        calls = Mock()
+        with patch.object(runtime, "parse_launch_args", wraps=runtime.parse_launch_args) as parse, \
+             patch.object(runtime, "apply_launcher_settings", wraps=runtime.apply_launcher_settings) as settings, \
+             patch.object(runtime, "apply_plane_mcp", wraps=runtime.apply_plane_mcp) as plane:
+            for name, mocked in (("parse", parse), ("settings", settings), ("plane", plane),
+                                 ("Runtime", self.factory)):
+                calls.attach_mock(mocked, name)
+            self.intercepted_launch(["-p", "Hi"], "terminal")
+        self.assertEqual([call[0] for call in calls.mock_calls],
+                         ["parse", "settings", "plane", "Runtime", "Runtime().has_login", "Runtime().start"])
+
+    def test_strict_and_unconfigured_launch_arguments_are_unchanged(self):
+        cases = ((False, ["-p", "Hi"]),
+                 (False, ["--mcp-config", "caller.json", "-p", "Hi"]),
+                 (True, ["--strict-mcp-config", "-p", "Hi"]),
+                 (True, ["--mcp-config=caller.json", "other.json", "--strict-mcp-config", "-p", "Hi"]))
+        for mode in self.MODES:
+            for configured, args in cases:
+                with self.subTest(mode=mode, configured=configured, args=args):
+                    settings = dict(self.settings)
+                    if not configured:
+                        del settings["plane_mcp_config"]
+                    forwarded, _ = self.intercepted_launch(args, mode, settings)
+                    expected, _ = runtime.parse_launch_args(self.mode_args(args, mode), "high")
+                    self.assertEqual(forwarded, runtime.apply_launcher_settings(expected))
+
+    def test_probes_skip_argument_helpers_login_proxy_and_file_reads(self):
+        with patch.object(runtime, "parse_launch_args", side_effect=AssertionError("Probe must not parse")), \
+             patch.object(runtime, "apply_launcher_settings", side_effect=AssertionError("Probe settings")), \
+             patch.object(runtime, "apply_plane_mcp", side_effect=AssertionError("Probe Plane config")):
+            for mode in ("terminal", "paseo"):
+                for configured in (False, True):
+                    for args in (["--version"], ["-v"], ["--help"], ["-h"],
+                                 ["auth", "status"], ["auth", "status", "--json"]):
+                        with self.subTest(mode=mode, configured=configured, args=args):
+                            settings = dict(self.settings)
+                            if not configured:
+                                del settings["plane_mcp_config"]
+                            forwarded, _ = self.intercepted_launch(args, mode, settings)
+                            self.assertEqual(forwarded, args)
+                            self.factory.assert_not_called()
+                            self.adopt.assert_not_called()
+                            self.read_json.assert_not_called()
+                            self.open.assert_not_called()
 
 
 class PaseoTranscriptTests(unittest.TestCase):

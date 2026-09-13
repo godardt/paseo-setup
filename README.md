@@ -28,7 +28,7 @@ From a checkout of this repository, run this on the computer hosting Claude Code
 bash install.sh
 ```
 
-Complete the ChatGPT sign-in when prompted. The script configures the proxy and, when detected, Paseo, including a small live request to verify Astra access. If your bin directory was added to `PATH`, open a new terminal after installation or use the absolute command printed by the installer.
+When prompted, enter a Plane personal API token to enable **read-only access to [peppy](https://app.plane.so/peppy/)**, or press Enter to skip. Complete the ChatGPT sign-in when prompted. The script configures the proxy and, when detected, Paseo, including a small live request to verify Astra access. Plane authentication is separate and is checked on the first Plane read, not by that Astra request. If your bin directory was added to `PATH`, open a new terminal after installation or use the absolute command printed by the installer.
 
 Requirements:
 
@@ -48,8 +48,9 @@ Model access and usage limits come from the signed-in ChatGPT account, not a pro
 4. Creates an isolated configuration, OAuth directory, random local API token, and Claude profile with private file permissions.
 5. Installs `claude-codex`, `claude-codex-proxy`, and (when Paseo is detected) `paseo-codex` into `~/.local/bin`, then adds that directory to your shell's startup configuration.
 6. When Paseo is detected, validates and backs up its Claude provider module, then applies the Claude-Codex-only compatibility patch: live context usage, forked-skill subagent tracking, and a mode catalog without auto mode. Also backs up and merges the new provider into `$PASEO_HOME/config.json` (default `~/.paseo/config.json`). Other providers and settings are preserved; unfamiliar or unwritable package layouts fail clearly rather than being patched blindly.
-7. Runs CLIProxyAPI's own ChatGPT OAuth login if needed, starts the local proxy, and sends a small Anthropic Messages request to Astra.
-8. When Paseo is detected, restarts the local Paseo daemon using that existing executable and reloads its configuration. Finish active Paseo sessions first, or pass `--skip-paseo-start` to activate it later.
+7. Offers a masked Plane token prompt, or reuses a saved/supplied token, and installs a private GET-only MCP connector for the `peppy` workspace. No additional packages are needed. Missing credentials in noninteractive/staged installs skip new Plane setup without blocking; existing connections are retained.
+8. Runs CLIProxyAPI's own ChatGPT OAuth login if needed, starts the local proxy, and sends a small Anthropic Messages request to Astra.
+9. When Paseo is detected, restarts the local Paseo daemon using that existing executable and reloads its configuration. Finish active Paseo sessions first, or pass `--skip-paseo-start` to activate it later.
 
 After updating the repository, run `./install.sh` again to copy the updated runtime, regenerate the installed launchers, and apply or verify the Paseo compatibility patch; editing this checkout alone does not update an existing installation. A Paseo package carrying the earlier usage-only patch is upgraded in place from its recovered upstream source. Reuse any custom directory options. The installer preserves the local API token and existing OAuth credentials. Rerunning stops the managed proxy and restarts Paseo when detected, so finish active sessions first. Existing unrelated programs called `claude-codex`, `claude-codex-proxy`, or `paseo-codex` are never overwritten. Explicit executable paths must point to the original programs, not these generated wrappers; self-referencing Claude and Paseo selections are rejected, including symlink aliases to the destination wrappers.
 
@@ -195,6 +196,41 @@ bash install.sh --help
 
 You can override `--bin-dir`, `--config-dir`, `--data-dir`, and `--state-dir`. The last three default to XDG directories when the corresponding XDG variables are set. Reuse the same directory options on later installer runs.
 
+## Read-only Plane connection
+
+A plain `./install.sh` offers to connect the managed **Claude Codex** provider to **https://app.plane.so/peppy/**. Open **[Plane's personal access tokens page](https://app.plane.so/settings/profile/api-tokens)** and choose **Add personal access token**, then paste it into the installer's prompt. The installer prints that direct URL and displays `*` for each entered character instead of revealing the token; Backspace deletes a character and Ctrl+U clears the field. Do not paste credentials into an agent conversation or commit them. Press Enter to skip new setup; later installer runs reuse a saved token without prompting.
+
+For noninteractive setup or token rotation, supply a private UTF-8 file containing only the token:
+
+```bash
+./install.sh --plane-api-key-file /secure/path/plane-token
+```
+
+Alternatively, provide `PLANE_API_KEY` through your secret manager/environment. Avoid entering literal secrets into shell history. Selection order is **explicit file → environment → saved credential → masked prompt**. Invalid explicit input fails rather than silently using an older token. The installer stores the selected token in a mode-`0600` file under its private config directory and removes the input environment variable before starting subprocesses. The credential is not placed in Paseo's provider JSON, launchers, MCP configuration, or agent environment.
+
+- `--skip-plane` skips setup and prompting, **preserving any existing Plane connection and token**; it is not an uninstall switch.
+- `--skip-login` suppresses the new-token prompt. A supplied or saved token can still be staged, without contacting Plane.
+- Noninteractive installs without a supplied or saved token skip new Plane setup and print that no connection was configured.
+- To replace an expired token, rerun with `--plane-api-key-file` or `PLANE_API_KEY`. A malformed saved credential file is reported rather than silently overwritten; inspect it before replacing it.
+
+### Available reads and enforcement
+
+The installed MCP server, `claude-codex-plane-peppy-readonly`, exposes only:
+
+- `list_projects` — list accessible projects in `peppy`.
+- `list_work_items` — list a project's work items using its UUID.
+- `get_work_item` — read a work item's details using project and work-item UUIDs.
+
+List tools return pagination metadata and accept `cursor` and `per_page` (at most 100). Access is limited by the token owner's Plane permissions. The connector hardcodes the Plane cloud API origin, `peppy` workspace, approved routes, and HTTP **GET**; it rejects redirects, mutation tools, arbitrary URLs/paths, and unrecognized parameters. It cannot create, edit, comment on, or delete Plane data. This is enforced by code, not by a prompt or a tool's `readOnlyHint` annotation. The current connector does not expose other Plane resources such as pages or cycles.
+
+**Security boundary:** this connector is read-only; your PAT/account and the entire agent are not necessarily read-only. A process with shell access to the credential file could use the token independently. Use a least-privilege Plane account and an appropriate expiration for stronger account-level protection. Plane's [official MCP server](https://developers.plane.so/dev-tools/mcp-server) requests read/write access and documents no separate read-only endpoint, so this integration deliberately does not register it.
+
+### Use in Paseo
+
+After running the installer, start a new **Claude Codex · GPT-6 Astra** agent and ask: “Use the Plane connection to list the projects in peppy.” The first read verifies the token and workspace access. A configured connection is not a claim that authentication has already succeeded. Authentication/authorization errors generally require checking the token, its expiry, and membership/project access in `peppy`; rate-limit errors require waiting before retrying.
+
+With `--skip-paseo-start`, finish active sessions and run `paseo-codex daemon restart` and `paseo-codex reload` before creating the agent. The same connection is available in terminal `claude-codex` sessions. Native Claude/Codex providers and their profiles are unchanged. Existing MCP configuration operands are retained; an explicit `--strict-mcp-config` intentionally suppresses automatic Plane injection, including when supplied by an SDK client.
+
 ## Authentication and diagnostics
 
 ```bash
@@ -220,6 +256,8 @@ Default files:
 | --- | --- |
 | `~/.config/claude-codex/settings.json` | Launcher settings and local API token |
 | `~/.config/claude-codex/proxy.yaml` | Generated CLIProxyAPI configuration (JSON syntax, valid YAML) |
+| `~/.config/claude-codex/plane-credentials.json` | Optional private Plane token and fixed workspace |
+| `~/.config/claude-codex/plane-mcp.json` | Optional MCP launch configuration; contains paths, not the Plane token |
 | `~/.config/claude-codex/install.lock` | Persistent lock file used to serialize installers for this configuration |
 | `~/.config/claude-codex/auth/` | ChatGPT OAuth credentials |
 | `~/.config/claude-codex/claude/` | Isolated Claude user profile and sessions for terminal launches |
@@ -268,6 +306,7 @@ Without integration environment variables, the real-binary tests are skipped. No
 - Paseo launches keeping the daemon's Claude profile, and moving a resumed session's transcript out of the isolated profile exactly once.
 - Login success/failure using temporary fake credentials, including stale credentials and same-content rewrites.
 - Generated shell launchers, runtime PATH, Bash startup-file precedence, and recursion guards.
+- Plane setup, masked terminal input and terminal restoration after Ctrl+C, credential precedence/retention/rotation, private file permissions, secret-free subprocess environments, MCP argument preservation/strict isolation, and the connector's fixed-workspace GET-only request and JSON-RPC handling.
 - Coordinated installer subprocesses verifying serialization, retained settings, and lock release on failure.
 - Download/checksum and archive-handling fixtures, provider configuration merging, and the stream-JSON usage adapter.
 - Live-usage cache accounting, request/compaction resets, malformed data, model switches, and unchanged native-provider behavior.
@@ -296,6 +335,8 @@ The optional tests verify Anthropic streaming, reasoning translation, option-lik
 The Paseo tests copy the selected CLI/server package into temporary directories, install twice into that private copy, and start/stop their own daemon using temporary configuration and a temporary Claude profile. Client connections explicitly target their loopback test endpoint, with no fallback to your normal daemon. The existing installed package, daemon, and `~/.claude` are unaffected. Allow temporary disk space for a copy of your Paseo package and dependencies. No real Codex backend or subscription quota is used by these tests.
 
 All **118 tests passed**, with no skips, in development validation on Linux with CLIProxyAPI 7.2.155, Claude Code 2.1.266, and a private copy of the locally installed Paseo; the daemon tests upgraded that copy's earlier usage-only patch in place. macOS and live ChatGPT OAuth were not exercised by this validation; login failures are simulated in offline tests. Model entitlement remains account-dependent, and the installer's live smoke test checks that path after you sign in.
+
+The Plane changes were verified on macOS with Python 3.14.7 and 3.9.6: **168 tests passed; 15 optional real-binary integration tests were skipped** on each run. This includes an installed stdio MCP handshake and mocked Plane API requests, not live access to `peppy`. Temporary package fixtures resolve macOS's `/var` symlink before comparing filesystem paths.
 
 ## Upstream references
 

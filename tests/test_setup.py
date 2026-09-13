@@ -132,7 +132,7 @@ class InstallTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="claude-codex-test-")
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name) / "space ' quote $dollar"
+        self.base = Path(self.temp.name).resolve() / "space ' quote $dollar"
         self.base.mkdir()
         self.settings = {"config_dir": str(self.base / "config"), "data_dir": str(self.base / "data"),
                          "state_dir": str(self.base / "state"), "bin_dir": str(self.base / "bin"),
@@ -682,6 +682,216 @@ class InstallTests(unittest.TestCase):
         system = self.fake_cli("paseo", "print('on path')\n")
         with patch.dict(os.environ, {"PATH": str(system.parent)}):
             self.assertEqual(install.detect_paseo(None, str(previous), self.base), str(system))
+
+    def test_plane_prompt_is_masked_optional_and_suppressed_when_staging(self):
+        opts = install.parser().parse_args(self.staged_args("--skip-paseo"))
+        config, data = Path(opts.config_dir), Path(opts.data_dir)
+        with patch.object(install.sys.stdin, "isatty", return_value=True), \
+             patch.object(install, "masked_input", return_value="prompt-plane-token") as prompt:
+            self.assertIsNone(install.prepare_plane(opts, {}, config, data, None))
+            prompt.assert_not_called()
+            opts.skip_login = False
+            with patch.object(install, "say") as say:
+                self.assertEqual(install.prepare_plane(opts, {}, config, data, None), "prompt-plane-token")
+            prompt.assert_called_once_with("Plane API token (masked with *; Enter to skip): ")
+            self.assertTrue(any("https://app.plane.so/settings/profile/api-tokens" in call.args[0]
+                                for call in say.call_args_list))
+            self.assertFalse(any("prompt-plane-token" in call.args[0] for call in say.call_args_list))
+            prompt.return_value = ""
+            self.assertIsNone(install.prepare_plane(opts, {}, config, data, None))
+            prompt.side_effect = OSError("sensitive fallback details")
+            with self.assertRaisesRegex(runtime.SetupError, "masked Plane token") as raised:
+                install.prepare_plane(opts, {}, config, data, None)
+            self.assertNotIn("sensitive", str(raised.exception))
+        with patch.object(install.sys.stdin, "isatty", return_value=False), \
+             patch.object(install, "masked_input") as prompt:
+            self.assertIsNone(install.prepare_plane(opts, {}, config, data, None))
+            prompt.assert_not_called()
+        self.assertFalse((config / "plane-credentials.json").exists())
+
+    def test_plane_credential_precedence_and_redacted_input_errors(self):
+        opts = install.parser().parse_args(self.staged_args("--skip-paseo"))
+        config, data = Path(opts.config_dir), Path(opts.data_dir)
+        previous = {"plane_mcp_config": str(config / "plane-mcp.json")}
+        runtime.write_json(config / "plane-credentials.json", {"workspace": "peppy", "api_key": "saved-plane-token"})
+        token_file = self.base / "supplied-token"
+        token_file.write_text("file-plane-token\n")
+        with patch.object(install, "masked_input") as prompt:
+            self.assertEqual(install.prepare_plane(opts, previous, config, data, None), "saved-plane-token")
+            self.assertEqual(install.prepare_plane(opts, previous, config, data, "environment-token"), "environment-token")
+            opts.plane_api_key_file = str(token_file)
+            self.assertEqual(install.prepare_plane(opts, previous, config, data, "environment-token"), "file-plane-token")
+            for value in ("secret-token\nsecond-line", "", "secret-token\x00"):
+                token_file.write_text(value)
+                with self.subTest(value=value), self.assertRaises(runtime.SetupError) as raised:
+                    install.prepare_plane(opts, previous, config, data, "environment-token")
+                self.assertNotIn("secret-token", str(raised.exception))
+            token_file.write_bytes(b"\xff")
+            with self.assertRaisesRegex(runtime.SetupError, "UTF-8"):
+                install.prepare_plane(opts, previous, config, data, None)
+            opts.plane_api_key_file = str(self.base / "missing-token")
+            with self.assertRaisesRegex(runtime.SetupError, "Cannot read"):
+                install.prepare_plane(opts, previous, config, data, None)
+            opts.plane_api_key_file = None
+            with self.assertRaises(runtime.SetupError):
+                install.prepare_plane(opts, previous, config, data, "")
+            prompt.assert_not_called()
+
+    def test_plane_invalid_credentials_fail_before_installation_changes(self):
+        opts = install.parser().parse_args(self.staged_args("--skip-paseo"))
+        with patch.dict(os.environ, {"PLANE_API_KEY": "secret-token\ninvalid"}), \
+             patch.object(install, "resolve_cli") as resolve, \
+             patch.object(install.Runtime, "stop") as stop, \
+             patch.object(install, "atomic_write") as write, \
+             patch.object(install, "write_json") as write_json:
+            with self.assertRaises(runtime.SetupError) as raised:
+                install.install(opts)
+            self.assertNotIn("secret-token", str(raised.exception))
+            self.assertNotIn("PLANE_API_KEY", os.environ)
+        resolve.assert_not_called()
+        stop.assert_not_called()
+        write.assert_not_called()
+        write_json.assert_not_called()
+
+    def test_plane_unowned_corrupt_and_symlinked_artifacts_are_preserved(self):
+        opts = install.parser().parse_args(self.staged_args("--skip-paseo"))
+        config, data = Path(opts.config_dir), Path(opts.data_dir)
+        credentials = config / "plane-credentials.json"
+        runtime.write_json(credentials, {"workspace": "another-workspace", "api_key": "secret-unrelated"})
+        before = credentials.read_bytes()
+        previous = {"plane_mcp_config": str(config / "plane-mcp.json")}
+        for saved in ({}, previous):
+            with self.subTest(saved=saved), self.assertRaises(runtime.SetupError) as raised:
+                install.prepare_plane(opts, saved, config, data, "new-token")
+            self.assertNotIn("secret-unrelated", str(raised.exception))
+            self.assertEqual(credentials.read_bytes(), before)
+        target = self.base / "external-credentials"
+        credentials.rename(target)
+        credentials.symlink_to(target)
+        with self.assertRaisesRegex(runtime.SetupError, "symlinked"):
+            install.prepare_plane(opts, previous, config, data, "new-token")
+        self.assertTrue(credentials.is_symlink())
+        self.assertEqual(target.read_bytes(), before)
+
+    def test_plane_staged_shell_install_reuses_rotates_and_loads_installed_mcp(self):
+        paseo = self.fake_paseo("paseo-plane", "print('Paseo')\n")
+        args = ["bash", str(ROOT / "install.sh"), *self.staged_args("--paseo-bin", str(paseo))]
+        env = {key: value for key, value in os.environ.items() if key != "PLANE_API_KEY"}
+        env["HOME"] = str(self.base / "home")
+        first_token, next_token = "fixture-plane-token-first", "fixture-plane-token-rotated"
+        result = subprocess.run(args, env={**env, "PLANE_API_KEY": first_token}, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=30, check=True)
+        self.assertNotIn(first_token, result.stdout + result.stderr)
+        config, data = Path(self.settings["config_dir"]), Path(self.settings["data_dir"])
+        settings = runtime.read_json(config / "settings.json")
+        credentials = config / "plane-credentials.json"
+        self.assertEqual(runtime.read_json(credentials), {"workspace": "peppy", "api_key": first_token})
+        self.assertEqual(settings["plane_mcp_config"], str(config / "plane-mcp.json"))
+        mcp = runtime.read_json(Path(settings["plane_mcp_config"]))["mcpServers"]
+        self.assertEqual(list(mcp), [install.plane_mcp.SERVER_NAME])
+        server = mcp[install.plane_mcp.SERVER_NAME]
+        self.assertTrue(Path(server["command"]).is_absolute())
+        self.assertTrue(os.path.samefile(server["command"], shutil.which("python3")))
+        self.assertEqual(server["args"], [str(data / "plane_mcp.py"), "--credentials", str(credentials)])
+        self.assertEqual((data / "plane_mcp.py").read_bytes(), (ROOT / "scripts" / "plane_mcp.py").read_bytes())
+        for path in (credentials, config / "plane-mcp.json", data / "plane_mcp.py"):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        for path in (config / "settings.json", config / "plane-mcp.json",
+                     self.base / "paseo-home" / "config.json",
+                     Path(self.settings["bin_dir"]) / "claude-codex"):
+            self.assertNotIn(first_token, path.read_text())
+        before = credentials.read_bytes()
+        credentials.chmod(0o644)
+        subprocess.run(args, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=30, check=True)
+        self.assertEqual(runtime.read_json(config / "settings.json"), settings)
+        self.assertEqual(credentials.read_bytes(), before)
+        self.assertEqual(credentials.stat().st_mode & 0o777, 0o600)
+        # Exercise the actual generated command without any tool that contacts Plane.
+        messages = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "offline-installer-test", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "ping"},
+        ]
+        protocol = subprocess.run([server["command"], *server["args"]], env=env, text=True,
+                                  input="".join(json.dumps(message) + "\n" for message in messages),
+                                  capture_output=True, timeout=10, check=True)
+        replies = [json.loads(line) for line in protocol.stdout.splitlines()]
+        self.assertEqual([reply["id"] for reply in replies], [1, 2, 3])
+        self.assertEqual(replies[0]["result"]["serverInfo"]["name"], install.plane_mcp.SERVER_NAME)
+        self.assertEqual({tool["name"] for tool in replies[1]["result"]["tools"]},
+                         {"list_projects", "list_work_items", "get_work_item"})
+        self.assertNotIn(first_token, protocol.stdout + protocol.stderr)
+        token_file = self.base / "rotated-token"
+        token_file.write_text(next_token + "\n")
+        result = subprocess.run([*args, "--plane-api-key-file", str(token_file)], env=env,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, check=True)
+        self.assertNotIn(next_token, result.stdout + result.stderr)
+        self.assertEqual(runtime.read_json(credentials)["api_key"], next_token)
+        self.assertFalse(list(config.glob("plane-credentials.json.claude-codex-backup-*")))
+
+    def test_plane_skip_retains_connection_and_does_not_consume_replacement(self):
+        opts = install.parser().parse_args(self.staged_args("--skip-paseo"))
+        with patch.dict(os.environ, {"PLANE_API_KEY": "retained-plane-token"}):
+            install.install(opts)
+        config, data = Path(opts.config_dir), Path(opts.data_dir)
+        paths = [config / "plane-credentials.json", config / "plane-mcp.json", data / "plane_mcp.py"]
+        before = {path: path.read_bytes() for path in paths}
+        opts.skip_plane = True
+        with patch.dict(os.environ, {"PLANE_API_KEY": "ignored-replacement"}), \
+             patch.object(install, "masked_input") as prompt:
+            install.install(opts)
+            self.assertNotIn("PLANE_API_KEY", os.environ)
+            prompt.assert_not_called()
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+        self.assertEqual(runtime.read_json(config / "settings.json")["plane_mcp_config"], str(config / "plane-mcp.json"))
+
+    def test_plane_changed_data_directory_does_not_overwrite_unrelated_helper(self):
+        opts = install.parser().parse_args(self.staged_args("--skip-paseo"))
+        with patch.dict(os.environ, {"PLANE_API_KEY": "move-plane-token"}):
+            install.install(opts)
+        config = Path(opts.config_dir)
+        protected = [config / name for name in ("settings.json", "plane-credentials.json", "plane-mcp.json")]
+        before = {path: path.read_bytes() for path in protected}
+        new_data = self.base / "new-data"
+        new_data.mkdir()
+        helper = new_data / "plane_mcp.py"
+        helper.write_text("unrelated existing program\n")
+        opts.data_dir = str(new_data)
+        with patch.object(install.Runtime, "stop") as stop, \
+             patch.object(install, "atomic_write") as write, \
+             patch.object(install, "write_json") as write_json:
+            with self.assertRaisesRegex(runtime.SetupError, "unrelated"):
+                install.install(opts)
+        stop.assert_not_called()
+        write.assert_not_called()
+        write_json.assert_not_called()
+        self.assertEqual(helper.read_text(), "unrelated existing program\n")
+        self.assertEqual({path: path.read_bytes() for path in protected}, before)
+        # Once our fixture collision is removed, a new directory is supported.
+        helper.unlink()
+        install.install(opts)
+        self.assertEqual(helper.read_bytes(), (ROOT / "scripts" / "plane_mcp.py").read_bytes())
+        self.assertEqual(runtime.read_json(config / "settings.json")["data_dir"], str(new_data))
+        self.assertEqual(runtime.read_json(config / "plane-mcp.json")["mcpServers"][install.plane_mcp.SERVER_NAME]["args"][0],
+                         str(helper))
+
+    def test_plane_input_environment_is_not_inherited_by_daemon(self):
+        paseo = self.fake_paseo("paseo-plane", "print('Paseo')\n")
+        opts = install.parser().parse_args(self.staged_args("--paseo-bin", str(paseo)))
+        opts.skip_paseo_start = False
+        def run(command, **kwargs):
+            self.assertNotIn("PLANE_API_KEY", os.environ)
+            self.assertNotIn("PLANE_API_KEY", kwargs.get("env", {}))
+            return subprocess.CompletedProcess(command, 0)
+        with patch.dict(os.environ, {"PLANE_API_KEY": "not-for-daemon"}), \
+             patch.object(paseo_compat, "check_syntax"), \
+             patch.object(install.subprocess, "run", side_effect=run) as spawn:
+            install.install(opts)
+        self.assertEqual([call.args[0] for call in spawn.call_args_list],
+                         [[str(paseo), "daemon", "restart"], [str(paseo), "reload"]])
 
     def test_launcher_refuses_to_replace_unrelated_program(self):
         target = self.base / "claude-codex"

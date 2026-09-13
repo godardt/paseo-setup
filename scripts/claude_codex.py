@@ -273,6 +273,49 @@ def apply_launcher_settings(args, updates=LAUNCHER_SETTINGS):
     return args[:i] + ["--settings", json.dumps(updates, separators=(",", ":"))] + args[i:]
 
 
+def apply_plane_mcp(args, settings):
+    """Add the private Plane config without reading any MCP configs or credentials.
+
+    Expects arguments normalized by parse_launch_args: the leading --model
+    terminates a newly prepended variadic --mcp-config group before any prompt.
+    Caller config operands stay opaque, and strict mode always opts out.
+    """
+    path = settings.get("plane_mcp_config")
+    if not path:
+        return args
+    last_config_end = None
+    managed_present = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            break
+        key, equal, value = arg.partition("=")
+        if key == "--strict-mcp-config":
+            return args
+        operands_start = i + 1
+        if (key in CLAUDE_VALUE_OPTIONS or key in ("--model", "--effort")) and not equal:
+            # Required operands may themselves look like flags or the separator.
+            i += 1
+            if i >= len(args):
+                raise SetupError(f"{key} needs a value")
+        if key in CLAUDE_VARIADIC_OPTIONS or (key in CLAUDE_OPTIONAL_VALUE_OPTIONS and not equal):
+            while i + 1 < len(args) and (not args[i + 1].startswith("-") or args[i + 1] == "-"):
+                i += 1
+                if key not in CLAUDE_VARIADIC_OPTIONS:
+                    break
+        if key == "--mcp-config":
+            last_config_end = i + 1
+            if (equal and value == path) or path in args[operands_start:i + 1]:
+                managed_present = True
+        i += 1
+    if managed_present:
+        return args
+    if last_config_end is not None:
+        return [*args[:last_config_end], path, *args[last_config_end:]]
+    return ["--mcp-config", path, *args]
+
+
 def isolated_profile(settings):
     return str(Path(settings["config_dir"]) / "claude")
 
@@ -297,7 +340,7 @@ def claude_env(settings, effort, source=None):
         "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
         "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
         "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
-        "CLAUDE_CODE_EFFORT_LEVEL", "MAX_THINKING_TOKENS",
+        "CLAUDE_CODE_EFFORT_LEVEL", "MAX_THINKING_TOKENS", "PLANE_API_KEY",
     ):
         env.pop(name, None)
     selected = model_id(effort)
@@ -664,6 +707,7 @@ def launch(settings, args):
         )
         if not auto_mode_allowed(os.environ):
             forwarded = apply_launcher_settings(forwarded)
+        forwarded = apply_plane_mcp(forwarded, settings)
         runtime = Runtime(settings)
         if not runtime.has_login():
             raise SetupError("ChatGPT login is missing. Run claude-codex-proxy login")
