@@ -15,9 +15,11 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import termios
 import time
 
 import paseo_compat
+import plane_mcp
 from claude_codex import (
     CONTEXT_WINDOW, EFFORTS, REASONING_MODES, ULTRACODE_MODEL, MARKER, MODEL, Runtime, SetupError, atomic_write, model_id,
     file_lock, proxy_config, read_json, say, write_json,
@@ -268,6 +270,101 @@ def add_path(bin_dir):
         atomic_write(target, old + block, mode=path.stat().st_mode & 0o777 if path.exists() else 0o644)
 
 
+def masked_input(prompt):
+    """Echo stars on a POSIX terminal, including Python versions before 3.14."""
+    fd = sys.stdin.fileno()
+    original = termios.tcgetattr(fd)
+    masked = original[:]
+    masked[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON)
+    masked[6] = original[6][:]
+    masked[6][termios.VMIN] = 1
+    masked[6][termios.VTIME] = 0
+    value = []
+    try:
+        termios.tcsetattr(fd, termios.TCSAFLUSH, masked)
+        sys.stderr.write(prompt)
+        sys.stderr.flush()
+        while True:
+            char = sys.stdin.read(1)
+            if char in ("\n", "\r"):
+                return "".join(value)
+            if not char or char == "\x04":
+                raise EOFError
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char in ("\x08", "\x7f"):
+                if value:
+                    value.pop()
+                    sys.stderr.write("\b \b")
+            elif char == "\x15":
+                sys.stderr.write("\b \b" * len(value))
+                value.clear()
+            elif char.isprintable():
+                value.append(char)
+                sys.stderr.write("*")
+            sys.stderr.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSAFLUSH, original)
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
+
+def prepare_plane(opts, previous, config_dir, data_dir, environment_key):
+    """Select credentials without writing files or contacting Plane."""
+    if opts.skip_plane:
+        return None
+    credentials = config_dir / "plane-credentials.json"
+    mcp_config = config_dir / "plane-mcp.json"
+    configured = previous.get("plane_mcp_config")
+    if configured and configured != str(mcp_config):
+        raise SetupError("Saved Plane configuration is outside this installation; inspect it before reconfiguring")
+    managed_paths = [(credentials, configured), (mcp_config, configured),
+                     (data_dir / "plane_mcp.py", configured and previous.get("data_dir") == str(data_dir))]
+    for path, owned in managed_paths:
+        if path.is_symlink() or (path.exists() and not owned):
+            raise SetupError(f"Refusing to overwrite an unrelated or symlinked Plane setup file: {path}")
+    saved_key = plane_mcp.load_credentials(credentials) if configured and credentials.exists() else None
+    if opts.plane_api_key_file:
+        try:
+            value = absolute(opts.plane_api_key_file).read_text()
+        except (OSError, UnicodeError):
+            raise SetupError("Cannot read --plane-api-key-file; provide a UTF-8 file containing only the token") from None
+        return plane_mcp.validate_api_key(value)
+    if environment_key is not None:
+        return plane_mcp.validate_api_key(environment_key)
+    if configured:
+        if saved_key is None:
+            raise SetupError("Saved Plane credentials are missing; provide --plane-api-key-file or use --skip-plane")
+        return saved_key
+    if opts.skip_login or not sys.stdin.isatty():
+        return None
+    say("Optional read-only Plane connection: https://app.plane.so/peppy/")
+    say("Create a token at https://app.plane.so/settings/profile/api-tokens (Add personal access token).")
+    say("Use a least-privilege account. Only this connector is read-only; the token itself may have write permissions.")
+    say("The token stays in private local storage.")
+    try:
+        value = masked_input("Plane API token (masked with *; Enter to skip): ")
+    except (EOFError, OSError, ValueError, termios.error):
+        raise SetupError("Cannot read a masked Plane token; use --plane-api-key-file or --skip-plane") from None
+    return plane_mcp.validate_api_key(value) if value.strip() else None
+
+
+def configure_plane(config_dir, data_dir, api_key):
+    credentials = config_dir / "plane-credentials.json"
+    helper = data_dir / "plane_mcp.py"
+    mcp_config = config_dir / "plane-mcp.json"
+    atomic_write(helper, Path(__file__).with_name("plane_mcp.py").read_text())
+    if not credentials.exists() or plane_mcp.load_credentials(credentials) != api_key:
+        # Do not leave backup copies of rotated tokens behind.
+        write_json(credentials, {"workspace": "peppy", "api_key": api_key})
+    credentials.chmod(0o600)
+    write_json(mcp_config, {"mcpServers": {plane_mcp.SERVER_NAME: {
+        "type": "stdio", "command": str(Path(sys.executable).absolute()),
+        "args": [str(helper), "--credentials", str(credentials)],
+    }}})
+    return str(mcp_config)
+
+
 def parser():
     p = argparse.ArgumentParser(description="Install claude-codex and CLIProxyAPI; configure Paseo only if detected")
     p.add_argument("--reasoning", choices=REASONING_MODES, help="Default reasoning level (first install: high)")
@@ -283,7 +380,10 @@ def parser():
     p.add_argument("--proxy-version", default=PROXY_VERSION)
     p.add_argument("--device-login", action="store_true", help="Use ChatGPT device-code login")
     p.add_argument("--no-browser", action="store_true", help="Print OAuth URL without opening a browser")
-    p.add_argument("--skip-login", action="store_true", help="Stage installation without authenticating")
+    p.add_argument("--skip-login", action="store_true", help="Stage installation without authenticating or prompting for Plane credentials")
+    plane = p.add_mutually_exclusive_group()
+    plane.add_argument("--plane-api-key-file", help="File containing a Plane personal API token for read-only peppy access (or set PLANE_API_KEY)")
+    plane.add_argument("--skip-plane", action="store_true", help="Skip Plane setup, preserving any previously configured connection")
     p.add_argument("--skip-smoke-test", action="store_true", help="Skip the small live Astra verification request")
     p.add_argument("--skip-paseo", action="store_true", help="Install terminal integration only")
     p.add_argument("--skip-paseo-start", action="store_true", help="Write Paseo configuration without restarting its daemon")
@@ -292,6 +392,8 @@ def parser():
 
 
 def install(opts):
+    # Input credentials must not be inherited by npm, the proxy, or the daemon.
+    plane_environment_key = os.environ.pop("PLANE_API_KEY", None)
     if sys.version_info < (3, 9):
         raise SetupError("Python 3.9+ is required")
     if sys.platform not in ("linux", "darwin"):
@@ -302,10 +404,10 @@ def install(opts):
         absolute(getattr(opts, key)) for key in ("config_dir", "data_dir", "state_dir", "bin_dir")
     )
     with file_lock(config_dir / "install.lock"):
-        return _install_locked(opts, config_dir, data_dir, state_dir, bin_dir)
+        return _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_environment_key)
 
 
-def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir):
+def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_environment_key):
     settings_file = config_dir / "settings.json"
     previous = read_json(settings_file) if settings_file.exists() else {}
     port = opts.port if opts.port is not None else previous.get("port", 8317)
@@ -339,6 +441,7 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir):
             if not owned:
                 raise SetupError(f"Refusing to overwrite unrelated program {path}")
     # Validate before downloads, stopping services, or replacing configuration.
+    plane_key = prepare_plane(opts, previous, config_dir, data_dir, plane_environment_key)
     paseo_patch = paseo_compat.prepare_patch(detected_paseo) if use_paseo else None
     claude_bin = resolve_cli("claude", opts.claude_bin, f"@anthropic-ai/claude-code@{CLAUDE_VERSION}", data_dir, previous.get("claude_bin"))
     if Path(claude_bin).name == "claude-codex" or Path(claude_bin).resolve() == (bin_dir / "claude-codex").resolve():
@@ -366,6 +469,14 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir):
         Runtime(previous).stop()
     runtime_file = data_dir / "claude_codex.py"
     atomic_write(runtime_file, Path(__file__).with_name("claude_codex.py").read_text())
+    if plane_key is not None:
+        settings["plane_mcp_config"] = configure_plane(config_dir, data_dir, plane_key)
+        say("Plane read-only connector configured for peppy; authentication will be checked on the first read.")
+    elif previous.get("plane_mcp_config"):
+        settings["plane_mcp_config"] = previous["plane_mcp_config"]
+        say("Plane setup skipped; the existing connection and credentials were retained.")
+    else:
+        say("Plane setup skipped; no connection configured. Rerun interactively or use --plane-api-key-file.")
     write_json(settings_file, settings)
     write_json(config_dir / "proxy.yaml", proxy_config(settings))
     # Keep the native claude profile untouched. Project CLAUDE.md and settings
