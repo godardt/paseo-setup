@@ -339,6 +339,92 @@ class PlaneMcpLaunchTests(unittest.TestCase):
                             self.open.assert_not_called()
 
 
+class PeppyProfileTests(unittest.TestCase):
+    """The second account forwards native arguments in its own profile."""
+
+    PATH = "/private/config with spaces/plane-mcp.json"
+
+    def setUp(self):
+        self.settings = {"claude_bin": "/private/bin/claude", "peppy_config_dir": "/private/claude-peppy",
+                         "plane_mcp_config": self.PATH, "node_dir": None}
+
+    def assert_appended(self, original, expected):
+        result = runtime.apply_plane_mcp(original, self.settings, prepend=False)
+        self.assertEqual(result, expected)
+        self.assertEqual(runtime.apply_plane_mcp(result, self.settings, prepend=False), result)
+
+    def test_group_is_appended_so_a_leading_prompt_stays_positional(self):
+        for original in ([], ["Hello", "world"], ["-p", "Hi"], ["--resume"],
+                         ["--settings", '{"model": "sonnet"}', "Hi"]):
+            with self.subTest(original=original):
+                self.assert_appended(original, [*original, "--mcp-config", self.PATH])
+
+    def test_group_is_inserted_before_the_literal_separator(self):
+        self.assert_appended(["Hello", "--", "--mcp-config", "literal"],
+                             ["Hello", "--mcp-config", self.PATH, "--", "--mcp-config", "literal"])
+        self.assert_appended(["--", "prompt text"], ["--mcp-config", self.PATH, "--", "prompt text"])
+
+    def test_strict_and_managed_and_unconfigured_arguments_are_unchanged(self):
+        managed = ["--mcp-config", "caller.json", self.PATH, "-p", "Hi"]
+        for args in (["--strict-mcp-config", "-p", "Hi"],
+                     ["-p", "Hi", "--strict-mcp-config"],
+                     ["--mcp-config=" + self.PATH],
+                     managed):
+            with self.subTest(args=args):
+                self.assertIs(runtime.apply_plane_mcp(args, self.settings, prepend=False), args)
+
+    def test_caller_groups_are_extended_without_repeating_the_flag(self):
+        for group in (["--mcp-config", "caller.json"],
+                      ["--mcp-config=caller.json", "other.json"],
+                      ["--mcp-config", "caller.json", "second.json"]):
+            for after in ([], ["-p", "Hi"], ["--", "literal"]):
+                with self.subTest(group=group, after=after):
+                    self.assert_appended([*group, *after], [*group, self.PATH, *after])
+
+    def test_environment_is_scrubbed_and_pinned_to_the_profile(self):
+        scrubbed = {"ANTHROPIC_API_KEY": "ambient", "ANTHROPIC_AUTH_TOKEN": "ambient",
+                    "ANTHROPIC_BASE_URL": "http://ambient.example", "ANTHROPIC_CUSTOM_HEADERS": "x",
+                    "ANTHROPIC_MODEL": "m", "ANTHROPIC_DEFAULT_MODEL": "m",
+                    "ANTHROPIC_SMALL_FAST_MODEL": "m", "CLAUDE_CODE_SUBAGENT_MODEL": "m",
+                    "CLAUDE_CODE_OAUTH_TOKEN": "t", "CLAUDE_CODE_USE_BEDROCK": "1",
+                    "CLAUDE_CODE_USE_VERTEX": "1", "CLAUDE_CODE_USE_FOUNDRY": "1",
+                    "CLAUDE_CODE_USE_MANTLE": "1", "CLAUDE_CODE_API_KEY_HELPER": "/bin/primary-key.sh",
+                    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "1",
+                    "CLAUDE_CODE_EFFORT_LEVEL": "high", "MAX_THINKING_TOKENS": "1",
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1050000",
+                    "CLAUDE_CODEX_PASEO_USAGE": "1", "CLAUDE_CODEX_AUTO_MODE": "1",
+                    "PLANE_API_KEY": "secret"}
+        scrubbed.update({f"ANTHROPIC_DEFAULT_{alias}_MODEL": "m"
+                         for alias in ("OPUS", "SONNET", "HAIKU", "FABLE")})
+        source = {"CLAUDE_CONFIG_DIR": "/inherited-profile", "HTTPS_PROXY": "http://proxy.example",
+                  "NO_PROXY": "internal.example", "PATH": "/usr/bin", "HOME": "/Users/test"}
+        env = runtime.peppy_env({**self.settings, "node_dir": "/private/node/bin"}, {**source, **scrubbed})
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/private/claude-peppy")
+        self.assertEqual(env["PATH"], "/private/node/bin:/usr/bin")
+        self.assertEqual(env["HTTPS_PROXY"], "http://proxy.example")
+        self.assertEqual(env["NO_PROXY"], "internal.example")
+        self.assertEqual(env["HOME"], "/Users/test")
+        for name in scrubbed:
+            self.assertNotIn(name, env, name)
+
+    def test_launch_forwards_arguments_and_requires_saved_settings(self):
+        with patch.object(runtime.os, "execve") as execute:
+            runtime.launch_peppy(self.settings, ["--settings", '{"env": {}}', "-p"])
+        binary, forwarded, env = execute.call_args.args
+        self.assertEqual(binary, "/private/bin/claude")
+        self.assertEqual(forwarded, [binary, "--settings", '{"env": {}}', "-p", "--mcp-config", self.PATH])
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/private/claude-peppy")
+        for args in (["--version"], ["-v"], ["--help"], ["-h"], ["auth", "status"]):
+            with self.subTest(args=args):
+                with patch.object(runtime.os, "execve") as execute:
+                    runtime.launch_peppy(self.settings, args)
+                self.assertEqual(execute.call_args.args[1], [self.settings["claude_bin"], *args])
+        for settings in ({"claude_bin": "/private/bin/claude"}, {"peppy_config_dir": "/private/claude-peppy"}):
+            with self.subTest(settings=sorted(settings)):
+                with self.assertRaises(runtime.SetupError):
+                    runtime.launch_peppy(settings, ["-p", "Hi"])
+
+
 class PaseoTranscriptTests(unittest.TestCase):
     """Sessions recorded by older launchers move into the profile Paseo reads."""
 

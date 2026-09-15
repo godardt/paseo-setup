@@ -56,6 +56,26 @@ CLAUDE_OPTIONAL_VALUE_OPTIONS = {
 LAUNCHER_SETTINGS = {"permissions": {"disableAutoMode": "disable"}}
 AUTO_MODE_OVERRIDE = "CLAUDE_CODEX_AUTO_MODE"
 
+# Ambient variables from the surrounding shell or daemon that would reroute a
+# Claude session or leak another provider's configuration into it.
+AMBIENT_SCRUB_ENV = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_API_KEY_HELPER", "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    "CLAUDE_CODE_EFFORT_LEVEL", "MAX_THINKING_TOKENS", "PLANE_API_KEY",
+)
+# The second account talks to Anthropic with its own login. Inherited routing
+# variables would silently redirect it or leak another provider's model
+# selection, so the ambient set plus every model and gateway override is
+# removed; the account is configured entirely through its own profile.
+PEPPY_SCRUB_ENV = (
+    *AMBIENT_SCRUB_ENV,
+    "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODEX_PASEO_USAGE", AUTO_MODE_OVERRIDE,
+)
+
 
 class SetupError(Exception):
     pass
@@ -273,12 +293,16 @@ def apply_launcher_settings(args, updates=LAUNCHER_SETTINGS):
     return args[:i] + ["--settings", json.dumps(updates, separators=(",", ":"))] + args[i:]
 
 
-def apply_plane_mcp(args, settings):
+def apply_plane_mcp(args, settings, prepend=True):
     """Add the private Plane config without reading any MCP configs or credentials.
 
-    Expects arguments normalized by parse_launch_args: the leading --model
-    terminates a newly prepended variadic --mcp-config group before any prompt.
-    Caller config operands stay opaque, and strict mode always opts out.
+    With prepend (the launcher's normalized arguments), the config starts the
+    argument list and the leading --model terminates the variadic --mcp-config
+    group before any prompt. Without it (the second account forwards native
+    arguments untouched), the config is appended at the end, before any literal
+    prompt tail, so a leading bare prompt cannot be swallowed as a variadic
+    operand. A caller's config group is extended in place in both cases, and
+    strict mode always opts out.
     """
     path = settings.get("plane_mcp_config")
     if not path:
@@ -313,7 +337,10 @@ def apply_plane_mcp(args, settings):
         return args
     if last_config_end is not None:
         return [*args[:last_config_end], path, *args[last_config_end:]]
-    return ["--mcp-config", path, *args]
+    if prepend:
+        return ["--mcp-config", path, *args]
+    # i marks the standalone separator, or the end when there is none.
+    return [*args[:i], "--mcp-config", path, *args[i:]]
 
 
 def isolated_profile(settings):
@@ -334,14 +361,15 @@ def daemon_profile(env):
     return Path(env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 
 
+def prepend_node_dir(env, settings):
+    """Keep a resolved Node directory usable for npm-shimmed CLIs and hooks."""
+    if settings.get("node_dir"):
+        env["PATH"] = settings["node_dir"] + os.pathsep + env.get("PATH", os.defpath)
+
+
 def claude_env(settings, effort, source=None):
     env = dict(os.environ if source is None else source)
-    for name in (
-        "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
-        "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
-        "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
-        "CLAUDE_CODE_EFFORT_LEVEL", "MAX_THINKING_TOKENS", "PLANE_API_KEY",
-    ):
+    for name in AMBIENT_SCRUB_ENV:
         env.pop(name, None)
     selected = model_id(effort)
     env.update({
@@ -373,8 +401,22 @@ def claude_env(settings, effort, source=None):
     # Local traffic must bypass inherited HTTP proxies, including in GUI daemons.
     for name in ("NO_PROXY", "no_proxy"):
         env[name] = ",".join(filter(None, [env.get(name), "127.0.0.1", "localhost"]))
-    if settings.get("node_dir"):
-        env["PATH"] = settings["node_dir"] + os.pathsep + env.get("PATH", os.defpath)
+    prepend_node_dir(env, settings)
+    return env
+
+
+def peppy_env(settings, source=None):
+    """Environment for the second account: its own profile, Anthropic endpoints.
+
+    The scrubbed routing variables cannot silently redirect the account to
+    another gateway or model selection; its login, settings, and any gateway
+    configuration belong to the profile directory itself.
+    """
+    env = dict(os.environ if source is None else source)
+    for name in PEPPY_SCRUB_ENV:
+        env.pop(name, None)
+    env["CLAUDE_CONFIG_DIR"] = settings["peppy_config_dir"]
+    prepend_node_dir(env, settings)
     return env
 
 
@@ -692,13 +734,17 @@ def run_paseo_stream(binary, args, env):
             signal.signal(signum, previous)
 
 
+def probe_args(args):
+    # Availability probes must succeed without login, proxy startup, or extra config.
+    return args in (["--version"], ["-v"], ["--help"], ["-h"]) or args[:2] == ["auth", "status"]
+
+
 def launch(settings, args):
     if args == ["--wrapper-help"]:
         print("Usage: claude-codex [--reasoning low|medium|high|xhigh|max|ultracode] [Claude Code arguments]\n"
               "Use claude-codex-proxy --help for login, diagnostics, and proxy controls.")
         return
-    # Availability probes must succeed without login or proxy startup.
-    probe = args in (["--version"], ["-v"], ["--help"], ["-h"]) or args[:2] == ["auth", "status"]
+    probe = probe_args(args)
     if probe:
         forwarded, effort = args, settings["reasoning"]
     else:
@@ -723,6 +769,21 @@ def launch(settings, args):
         if is_stream_json(forwarded):
             raise SystemExit(run_paseo_stream(binary, forwarded, env))
     os.execve(binary, [binary, *forwarded], env)
+
+
+def launch_peppy(settings, args):
+    """Run the second Claude account in its own profile (see peppy_env)."""
+    if args == ["--wrapper-help"]:
+        print("Usage: claude-peppy [Claude Code arguments]\n"
+              "The second account uses its own profile and Anthropic login; run it once to sign in.")
+        return
+    for key in ("claude_bin", "peppy_config_dir"):
+        if not settings.get(key):
+            raise SetupError(f"{key} is missing from the saved settings; rerun install.sh")
+    if not probe_args(args):
+        args = apply_plane_mcp(args, settings, prepend=False)
+    binary = settings["claude_bin"]
+    os.execve(binary, [binary, *args], peppy_env(settings))
 
 
 def control(settings, args):
@@ -773,6 +834,8 @@ def main():
     settings = read_json(settings_file)
     if mode == "launch":
         launch(settings, args)
+    elif mode == "peppy":
+        launch_peppy(settings, args)
     elif mode == "proxy":
         control(settings, args)
     else:

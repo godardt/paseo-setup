@@ -171,6 +171,7 @@ class InstallTests(unittest.TestCase):
         return ["--config-dir", self.settings["config_dir"], "--data-dir", self.settings["data_dir"],
                 "--state-dir", self.settings["state_dir"], "--bin-dir", self.settings["bin_dir"],
                 "--paseo-home", str(self.base / "paseo-home"), "--claude-bin", str(claude),
+                "--peppy-config-dir", str(self.base / "claude-peppy"),
                 "--proxy-binary", str(proxy), "--skip-login", "--skip-paseo-start", "--no-path", *extra]
 
     def test_paseo_wrapper_uses_runtime_path_and_quoted_node_prefix(self):
@@ -436,10 +437,12 @@ class InstallTests(unittest.TestCase):
             "providers": {"claude": {"enabled": True}, "other": {"extends": "codex", "label": "Other"}}
         }}
         runtime.write_json(config_file, original)
-        install.merge_paseo(config_file, self.settings, {})
+        self.settings["peppy_config_dir"] = str(self.base / "claude-peppy")
+        install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
         actual = runtime.read_json(config_file)
         self.assertEqual(actual["daemon"], original["daemon"])
         self.assertEqual(actual["agents"]["providers"]["claude"], {"enabled": True})
+        self.assertEqual(actual["agents"]["providers"]["other"], original["agents"]["providers"]["other"])
         provider = actual["agents"]["providers"]["claude-codex"]
         self.assertEqual(provider["extends"], "claude")
         self.assertEqual(provider["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1050000")
@@ -452,18 +455,47 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(provider["models"][-1]["id"], runtime.ULTRACODE_MODEL)
         self.assertEqual(sum(m["isDefault"] for m in provider["models"]), 1)
         self.assertEqual(provider["models"][4]["id"], "gpt-6-astra(max)")
+        peppy = actual["agents"]["providers"]["claude-peppy"]
+        self.assertEqual(peppy["extends"], "claude")
+        self.assertEqual(peppy["label"], "Claude Peppy")
+        self.assertEqual(peppy["command"], [str(self.base / "bin" / "claude-peppy")])
+        self.assertEqual(peppy["env"], {"CLAUDE_CONFIG_DIR": str(self.base / "claude-peppy")})
+        self.assertNotIn("models", peppy)
         self.assertNotIn("test-local-key", config_file.read_text())
         first = config_file.read_bytes()
-        install.merge_paseo(config_file, self.settings, {"paseo_config": str(config_file)})
+        install.merge_paseo(config_file, self.settings, {"paseo_config": str(config_file)}, include_peppy=True)
         self.assertEqual(config_file.read_bytes(), first)
         self.assertEqual(len(list(self.base.glob("paseo.json.claude-codex-backup-*"))), 1)
+
+    def test_paseo_merge_without_peppy_leaves_existing_entry_untouched(self):
+        config_file = self.base / "paseo.json"
+        self.settings["peppy_config_dir"] = str(self.base / "claude-peppy")
+        runtime.write_json(config_file, {"version": 1, "agents": {"providers": {
+            "claude-peppy": {"extends": "claude", "label": "User-renamed Peppy", "env": {}}
+        }}})
+        install.merge_paseo(config_file, self.settings, {"paseo_config": str(config_file)}, include_peppy=False)
+        providers = runtime.read_json(config_file)["agents"]["providers"]
+        self.assertEqual(providers["claude-peppy"]["label"], "User-renamed Peppy")
+        self.assertIn("claude-codex", providers)
+
+    def test_unrelated_same_name_provider_is_rejected_per_key(self):
+        for name, expected in (("claude-codex", "claude-codex"), ("claude-peppy", "claude-peppy")):
+            with self.subTest(provider=name):
+                config_file = self.base / f"paseo-{name}.json"
+                runtime.write_json(config_file, {"version": 1, "agents": {"providers": {
+                    name: {"extends": "claude", "label": "Unrelated"}
+                }}})
+                self.settings["peppy_config_dir"] = str(self.base / "claude-peppy")
+                with self.assertRaises(runtime.SetupError) as caught:
+                    install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
+                self.assertIn(expected, str(caught.exception))
 
     def test_invalid_paseo_config_not_overwritten(self):
         for content in ('{"agents":[]}', '{"agents":{"providers":[]}}', '{bad', '[]'):
             path = self.base / "invalid.json"
             path.write_text(content)
             with self.assertRaises(runtime.SetupError):
-                install.merge_paseo(path, self.settings, {})
+                install.merge_paseo(path, self.settings, {}, include_peppy=False)
             self.assertEqual(path.read_text(), content)
 
     def test_download_checksum_failure_never_installs(self):
@@ -516,12 +548,20 @@ class InstallTests(unittest.TestCase):
                 "--data-dir", self.settings["data_dir"], "--state-dir", self.settings["state_dir"],
                 "--bin-dir", self.settings["bin_dir"], "--paseo-home", str(self.base / "paseo"),
                 "--claude-bin", str(claude), "--paseo-bin", str(paseo), "--proxy-binary", str(proxy),
+                "--peppy-config-dir", str(self.base / "claude-peppy"),
                 "--skip-login", "--skip-paseo-start", "--no-path"]
         reader = paseo_compat.find_usage_reader(paseo)
         original_reader = reader.read_text()
         subprocess.run(args, check=True, capture_output=True, text=True)
         config_file = Path(self.settings["config_dir"]) / "settings.json"
         first = runtime.read_json(config_file)
+        self.assertEqual(first["peppy_config_dir"], str(self.base / "claude-peppy"))
+        self.assertEqual((self.base / "claude-peppy").stat().st_mode & 0o777, 0o700)
+        peppy_launcher = Path(self.settings["bin_dir"]) / "claude-peppy"
+        self.assertEqual(peppy_launcher.read_text().splitlines()[1], install.MARKER)
+        peppy_provider_entry = runtime.read_json(self.base / "paseo" / "config.json")["agents"]["providers"]["claude-peppy"]
+        self.assertEqual(peppy_provider_entry["command"], [str(peppy_launcher)])
+        self.assertEqual(peppy_provider_entry["env"], {"CLAUDE_CONFIG_DIR": str(self.base / "claude-peppy")})
         patched_reader = reader.read_text()
         self.assertEqual(patched_reader, paseo_compat.patch_source(original_reader))
         backups = list(reader.parent.glob("agent.js.claude-codex-backup-*"))
@@ -595,6 +635,7 @@ class InstallTests(unittest.TestCase):
         args = ["--config-dir", self.settings["config_dir"], "--data-dir", self.settings["data_dir"],
                 "--state-dir", self.settings["state_dir"], "--bin-dir", self.settings["bin_dir"],
                 "--paseo-home", str(self.base / "absent-paseo"), "--claude-bin", str(claude),
+                "--peppy-config-dir", str(self.base / "claude-peppy"),
                 "--proxy-binary", str(proxy), "--skip-login", "--no-path"]
         with patch.dict(os.environ, {"PATH": ""}), patch.object(install.subprocess, "run") as run:
             install.install(install.parser().parse_args(args))
@@ -615,6 +656,7 @@ class InstallTests(unittest.TestCase):
         args = ["--config-dir", self.settings["config_dir"], "--data-dir", self.settings["data_dir"],
                 "--state-dir", self.settings["state_dir"], "--bin-dir", self.settings["bin_dir"],
                 "--paseo-home", str(self.base / "paseo-home"), "--port", str(port),
+                "--peppy-config-dir", str(self.base / "claude-peppy"),
                 "--claude-bin", str(claude), "--proxy-binary", str(proxy), "--skip-login", "--no-path"]
         install.install(install.parser().parse_args(args + ["--paseo-bin", str(private_paseo), "--skip-paseo-start"]))
         test_path = str(self.base) + os.pathsep + os.environ.get("PATH", "")
@@ -899,6 +941,113 @@ class InstallTests(unittest.TestCase):
         with self.assertRaises(runtime.SetupError):
             install.write_launcher(target, ["false"])
         self.assertEqual(target.read_text(), "existing program")
+
+    def test_peppy_launcher_runs_shared_cli_in_its_own_profile(self):
+        claude = self.fake_cli("claude-reporting", "import json,os,sys\n"
+                               "print(json.dumps({'args':sys.argv[1:],'config':os.environ.get('CLAUDE_CONFIG_DIR'),"
+                               "'base':os.environ.get('ANTHROPIC_BASE_URL'),'key':os.environ.get('ANTHROPIC_API_KEY')}))\n")
+        install.install(install.parser().parse_args(self.staged_args("--skip-paseo", "--claude-bin", str(claude))))
+        settings = runtime.read_json(Path(self.settings["config_dir"]) / "settings.json")
+        wrapper = Path(self.settings["bin_dir"]) / "claude-peppy"
+        environment = {**os.environ, "ANTHROPIC_BASE_URL": "http://ambush.example",
+                       "ANTHROPIC_API_KEY": "ambient-key", "ANTHROPIC_MODEL": "ambient-model",
+                       "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1050000"}
+        result = subprocess.run([str(wrapper), "-p", "hello", "world"], check=True,
+                                capture_output=True, text=True, env=environment)
+        self.assertEqual(json.loads(result.stdout), {
+            "args": ["-p", "hello", "world"],
+            "config": str(self.base / "claude-peppy"),
+            "base": None,
+            "key": None,
+        })
+        self.assertNotIn("ambient-model", result.stdout)
+        with patch.object(runtime.os, "execve") as execute:
+            runtime.launch_peppy(settings, ["--version"])
+        binary, forwarded, env = execute.call_args.args
+        self.assertEqual((binary, forwarded), (settings["claude_bin"], [settings["claude_bin"], "--version"]))
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.base / "claude-peppy"))
+
+    def test_peppy_profile_directory_and_settings_round_trip(self):
+        custom = self.base / "second-profile"
+        install.install(install.parser().parse_args(self.staged_args("--skip-paseo", "--peppy-config-dir", str(custom))))
+        settings_file = Path(self.settings["config_dir"]) / "settings.json"
+        self.assertEqual(runtime.read_json(settings_file)["peppy_config_dir"], str(custom))
+        # A plain rerun without the flag keeps the previously chosen directory.
+        rerun = self.staged_args("--skip-paseo")
+        del rerun[rerun.index("--peppy-config-dir"):rerun.index("--peppy-config-dir") + 2]
+        install.install(install.parser().parse_args(rerun))
+        self.assertEqual(runtime.read_json(settings_file)["peppy_config_dir"], str(custom))
+        self.assertEqual(custom.stat().st_mode & 0o777, 0o700)
+        # A user-prepared profile keeps its own permissions.
+        prepared = self.base / "prepared-profile"
+        prepared.mkdir(mode=0o755)
+        install.install(install.parser().parse_args(self.staged_args("--skip-paseo", "--peppy-config-dir", str(prepared))))
+        self.assertEqual(prepared.stat().st_mode & 0o777, 0o755)
+
+    def test_peppy_profile_must_differ_from_primary_claude_profile(self):
+        for forbidden in (Path.home() / ".claude", Path(self.settings["config_dir"]) / "claude"):
+            with self.subTest(profile=forbidden):
+                args = self.staged_args("--skip-paseo", "--peppy-config-dir", str(forbidden))
+                with patch.object(install, "atomic_write") as write:
+                    with self.assertRaisesRegex(runtime.SetupError, "must not be the primary Claude profile"):
+                        install.install(install.parser().parse_args(args))
+                write.assert_not_called()
+
+    def test_peppy_directory_change_requires_updating_paseo_provider(self):
+        paseo = self.fake_paseo("paseo", "print('paseo')\n")
+        install.install(install.parser().parse_args(self.staged_args("--paseo-bin", str(paseo))))
+        config_file = self.base / "paseo-home" / "config.json"
+        self.assertIn("claude-peppy", runtime.read_json(config_file)["agents"]["providers"])
+        # Without Paseo in this run the retained provider entry would keep
+        # pinning the old profile while the launcher moves to the new one.
+        moved = self.staged_args("--skip-paseo", "--peppy-config-dir", str(self.base / "moved-peppy"))
+        with patch.object(install, "atomic_write") as write:
+            with self.assertRaisesRegex(runtime.SetupError, "claude-peppy provider entry"):
+                install.install(install.parser().parse_args(moved))
+        write.assert_not_called()
+
+    def test_skip_peppy_writes_no_launcher_or_entry_and_retains_previous(self):
+        install.install(install.parser().parse_args(self.staged_args("--skip-paseo")))
+        settings_file = Path(self.settings["config_dir"]) / "settings.json"
+        bin_dir = Path(self.settings["bin_dir"])
+        launcher = bin_dir / "claude-peppy"
+        installed = launcher.read_bytes()
+        skip_args = self.staged_args("--skip-paseo")
+        del skip_args[skip_args.index("--peppy-config-dir"):skip_args.index("--peppy-config-dir") + 2]
+        skip_args.append("--skip-peppy")
+        # An explicit directory together with --skip-peppy is contradictory.
+        with self.assertRaises(SystemExit):
+            install.parser().parse_args([*skip_args, "--peppy-config-dir", str(self.base / "other")])
+        with patch.dict(os.environ, {"HOME": str(self.base / "isolated-home")}):
+            install.install(install.parser().parse_args(skip_args))
+        # Skipping preserves the existing launcher and the saved directory it reads.
+        self.assertEqual(launcher.read_bytes(), installed)
+        self.assertTrue((bin_dir / "claude-codex").exists())
+        self.assertEqual(runtime.read_json(settings_file)["peppy_config_dir"], str(self.base / "claude-peppy"))
+        with patch.dict(os.environ, {"HOME": str(self.base / "isolated-home")}):
+            fresh = ["--config-dir", str(self.base / "fresh-config"), "--data-dir", str(self.base / "fresh-data"),
+                     "--state-dir", str(self.base / "fresh-state"), "--bin-dir", str(self.base / "fresh-bin"),
+                     "--skip-login", "--skip-paseo", "--no-path", "--skip-peppy"]
+            claude = self.fake_cli("claude-original", "print('Claude Code')\n")
+            fresh += ["--claude-bin", str(claude), "--proxy-binary", str(self.fake_cli("p", "raise SystemExit(1)\n"))]
+            install.install(install.parser().parse_args(fresh))
+        self.assertNotIn("peppy_config_dir", runtime.read_json(self.base / "fresh-config" / "settings.json"))
+        self.assertFalse((self.base / "isolated-home" / ".claude-peppy").exists())
+
+    def test_claude_bin_pointing_at_peppy_wrapper_is_rejected(self):
+        wrapper = self.base / "bin" / "claude-peppy"
+        wrapper.parent.mkdir(parents=True)
+        wrapper.write_text(install.MARKER + "\n")
+        wrapper.chmod(0o755)
+        args = self.staged_args("--skip-paseo", "--claude-bin", str(wrapper))
+        with patch.object(install, "atomic_write") as write:
+            with self.assertRaisesRegex(runtime.SetupError, "--claude-bin must point to the original Claude executable"):
+                install.install(install.parser().parse_args(args))
+        write.assert_not_called()
+        # An unrelated program named claude-peppy is never overwritten.
+        wrapper.write_text("someone else's program")
+        with self.assertRaisesRegex(runtime.SetupError, "Refusing to overwrite unrelated program"):
+            install.install(install.parser().parse_args(self.staged_args("--skip-paseo")))
 
 
 if __name__ == "__main__":

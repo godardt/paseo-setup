@@ -60,16 +60,6 @@ function claudeCodexProviderEnv(session) {
 function claudeCodexEnabled(env) {
     return env?.CLAUDE_CODEX_PASEO_USAGE === "1";
 }
-// The daemon resolves transcripts, importable sessions, and settings-discovered
-// models from its own CLAUDE_CONFIG_DIR (or ~/.claude), never from the env of
-// the provider it spawns. A provider entry that pins CLAUDE_CONFIG_DIR — such
-// as the installer's second-account provider — therefore writes sessions to a
-// profile the daemon cannot read back. These patched call sites prefer the
-// provider's own value; providers without one keep the upstream resolution.
-function claudeCodexProviderConfigDir(env) {
-    const value = env?.CLAUDE_CONFIG_DIR;
-    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
-}
 // Claude's auto mode needs Anthropic's classifier models, which the Codex
 // gateway cannot serve; the launcher therefore disables auto mode in Claude
 // itself. Paseo's mode catalog must not offer or default to a mode that the

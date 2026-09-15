@@ -2,6 +2,9 @@
 
 The adapter gives the Claude Codex provider live context usage, subagent
 tracking for forked skills, and a mode catalog without Claude's auto mode.
+It also resolves Claude profiles from a provider entry's own CLAUDE_CONFIG_DIR
+for history replay, importable sessions, and settings-discovered models, so a
+provider such as the installer's second account keeps its own transcripts.
 Paseo's regular Claude provider keeps its original behavior.
 """
 
@@ -50,6 +53,35 @@ REPLAY_ROOT_CALL = "parent: readClaudeReplayParentFacts(parentEntries),"
 PATCHED_REPLAY_ROOT_CALL = REPLAY_ROOT_CALL[:-2] + ", claudeCodexForkedSkills(this)),"
 REPLAY_CHILD_CALL = "parentFacts: readClaudeReplayParentFacts(entries),"
 PATCHED_REPLAY_CHILD_CALL = REPLAY_CHILD_CALL[:-2] + ", claudeCodexForkedSkills(this)),"
+# The daemon reads transcripts, importable sessions, and settings-discovered
+# models from its own CLAUDE_CONFIG_DIR (or ~/.claude), never from the env of
+# the provider it spawns. These edits prefer the provider's pinned value, so
+# providers without one keep the upstream resolution.
+PROFILE_CONFIG_DIR = '        const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");'
+RESOLVE_HISTORY = (
+    "resolveHistoryPath(sessionId) {\n"
+    "        const cwd = this.config.cwd;\n"
+    "        if (!cwd)\n"
+    "            return null;\n" + PROFILE_CONFIG_DIR
+)
+PATCHED_RESOLVE_HISTORY = (
+    "resolveHistoryPath(sessionId) {\n"
+    "        const cwd = this.config.cwd;\n"
+    "        if (!cwd)\n"
+    "            return null;\n"
+    "        const configDir = claudeCodexProviderConfigDir(claudeCodexProviderEnv(this)) "
+    '?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");'
+)
+LIST_IMPORTABLE = "async listImportableSessions(options) {\n" + PROFILE_CONFIG_DIR
+PATCHED_LIST_IMPORTABLE = (
+    "async listImportableSessions(options) {\n"
+    "        const configDir = claudeCodexProviderConfigDir(this.runtimeSettings?.env) "
+    '?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");'
+)
+MODELS_REFRESH = "getClaudeModelsWithSettings(this.logger, this.configDir, claudeCodeVersion)"
+PATCHED_MODELS_REFRESH = ("getClaudeModelsWithSettings(this.logger, "
+                          "claudeCodexProviderConfigDir(this.runtimeSettings?.env) ?? this.configDir, "
+                          "claudeCodeVersion)")
 # These are the consumer contracts the adapter relies on, not a package version
 # check. Leave unfamiliar source untouched rather than guessing.
 AGENT_ANCHORS = (
@@ -72,6 +104,13 @@ AGENT_ANCHORS = (
     "ingestPersistedSidechains(parentContent, sidechains) {",
     "if (this.taskProtocolSource.announcesTasks && !canonicalSubagentId) {",
     "isDescriptorOwnedElsewhere: () => this.taskProtocolSource.isActive,",
+    # The client methods above read the provider entry environment through this
+    # field; the head identifies the client constructor specifically.
+    'this.provider = "claude";\n'
+    "        this.capabilities = CLAUDE_CAPABILITIES;\n"
+    "        this.defaults = options.defaults;\n"
+    '        this.logger = options.logger.child({ module: "agent", provider: "claude" });\n'
+    "        this.runtimeSettings = options.runtimeSettings;",
 )
 # The subclass in the adapter extends this class, which Paseo keeps in a
 # sibling module. It is read to confirm the contract and never modified.
@@ -99,12 +138,42 @@ def adapter_source(name="paseo_usage.js"):
 
 
 def previous_replacements():
-    """The layout written by earlier installers, recognized only to upgrade it."""
+    """The usage-only layout written by earlier installers, recognized only to upgrade it."""
     return (
         (BASE_CLASS, RENAMED_CLASS),
         (SESSION_CLASS, adapter_source("paseo_usage_previous.js") + SESSION_CLASS),
         (INITIALIZER, PATCHED_INITIALIZER),
     )
+
+
+def prior_replacements():
+    """The layout written before provider-scoped profile resolution, recognized only to upgrade it.
+
+    Frozen exactly as that era's installer wrote it, with its adapter kept
+    byte-identical beside this script; deriving it from today's edits instead
+    would silently grow this layout whenever replacements() changes and strand
+    installations patched by the era. A future layout change freezes its own
+    literal here and its own adapter file.
+    """
+    return (
+        (BASE_CLASS, RENAMED_CLASS),
+        (SESSION_CLASS, adapter_source("paseo_usage_prior.js") + SESSION_CLASS),
+        (INITIALIZER, PATCHED_INITIALIZER),
+        (TASK_SOURCE_IMPORT, RENAMED_TASK_SOURCE_IMPORT),
+        (TASK_SOURCE_NEW, PATCHED_TASK_SOURCE_NEW),
+        (RESOLVE_SIDECHAIN, PATCHED_RESOLVE_SIDECHAIN),
+        (FINISH_SIDECHAIN, PATCHED_FINISH_SIDECHAIN),
+        (MODE_CATALOG, PATCHED_MODE_CATALOG),
+        (AVAILABLE_MODES, PATCHED_AVAILABLE_MODES),
+        (REPLAY_FACTS, RENAMED_REPLAY_FACTS),
+        (REPLAY_ROOT_CALL, PATCHED_REPLAY_ROOT_CALL),
+        (REPLAY_CHILD_CALL, PATCHED_REPLAY_CHILD_CALL),
+    )
+
+
+def superseded_layouts():
+    """Older patch layouts, newest first, recognized only to upgrade them."""
+    return (prior_replacements(), previous_replacements())
 
 
 def reverse_edits(source, edits):
@@ -134,7 +203,21 @@ def replacements():
         (REPLAY_FACTS, RENAMED_REPLAY_FACTS),
         (REPLAY_ROOT_CALL, PATCHED_REPLAY_ROOT_CALL),
         (REPLAY_CHILD_CALL, PATCHED_REPLAY_CHILD_CALL),
+        (RESOLVE_HISTORY, PATCHED_RESOLVE_HISTORY),
+        (LIST_IMPORTABLE, PATCHED_LIST_IMPORTABLE),
+        (MODELS_REFRESH, PATCHED_MODELS_REFRESH),
     )
+
+
+def profiles_unresolved(source):
+    """An unpatched Claude profile resolution remains; patched sites rewrite it.
+
+    Upstream scatters the same resolution line across call sites. Anchors prove
+    the known sites are editable, not that no others exist, so a Paseo release
+    adding one would otherwise install silently incomplete and replay Claude
+    Peppy sessions from the daemon's primary profile.
+    """
+    return PROFILE_CONFIG_DIR in source
 
 
 def patch_source(source):
@@ -148,11 +231,12 @@ def patch_source(source):
                 raise SetupError("Paseo's claude-codex compatibility patch has an unsupported structure")
             return source
         # An earlier installer's layout is upgraded from the recovered upstream source.
-        original = reverse_edits(source, previous_replacements())
-        if original is None:
-            raise SetupError("Paseo's claude-codex compatibility patch is incomplete or modified; "
-                             "restore its backup or reinstall Paseo, then rerun ./install.sh")
-        return patch_source(original)
+        for superseded in superseded_layouts():
+            original = reverse_edits(source, superseded)
+            if original is not None:
+                return patch_source(original)
+        raise SetupError("Paseo's claude-codex compatibility patch is incomplete or modified; "
+                         "restore its backup or reinstall Paseo, then rerun ./install.sh")
     if any(patched in source for _, patched in edits):
         raise SetupError("Paseo has a partial claude-codex compatibility patch; "
                          "restore the original and rerun ./install.sh")
@@ -166,6 +250,10 @@ def patch_source(source):
                          "Update this checkout for the installed Paseo layout, or use --skip-paseo for terminal-only setup")
     for upstream, patched in edits:
         source = source.replace(upstream, patched, 1)
+    if profiles_unresolved(source):
+        raise SetupError("Unsupported Paseo Claude provider source: a Claude profile resolution the patch does "
+                         "not know remains unpatched. Update this checkout for the installed Paseo layout, "
+                         "or use --skip-paseo for terminal-only setup")
     return source
 
 
