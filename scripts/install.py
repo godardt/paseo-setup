@@ -40,6 +40,29 @@ def absolute(value):
     return Path(value).expanduser().resolve()
 
 
+def xdg_home(variable, home_suffix):
+    return os.environ.get(variable, str(Path.home() / home_suffix))
+
+
+def default_dir(variable, home_suffix, name):
+    return os.path.join(xdg_home(variable, home_suffix), name)
+
+
+def launcher_is_owned(path):
+    """True when an existing launcher file was written by this installer."""
+    try:
+        return MARKER in Path(path).read_text()
+    except (OSError, UnicodeError):
+        return False
+
+
+def assert_original_binary(value, bin_dir, wrappers, flag, program):
+    """Reject CLI selections that point at this installer's own wrappers."""
+    resolved = Path(value).resolve()
+    if Path(value).name in wrappers or resolved in {(bin_dir / name).resolve() for name in wrappers}:
+        raise SetupError(f"{flag} must point to the original {program} executable")
+
+
 def backup(path):
     path = Path(path)
     if path.exists():
@@ -194,6 +217,20 @@ def provider(settings):
     }
 
 
+def peppy_provider(settings):
+    return {
+        "extends": "claude",
+        "label": "Claude Peppy",
+        "description": "Second Claude Code account in its own profile",
+        "command": [str(Path(settings["bin_dir"]) / "claude-peppy")],
+        "enabled": True,
+        # The compatibility patch makes the daemon read this profile for an
+        # agent's transcripts, importable sessions, and settings-discovered
+        # models; Claude itself always runs in it.
+        "env": {"CLAUDE_CONFIG_DIR": settings["peppy_config_dir"]},
+    }
+
+
 def load_paseo(path):
     config = read_json(path) if path.exists() else {"version": 1}
     if config.get("version", 1) != 1:
@@ -207,28 +244,34 @@ def load_paseo(path):
     return config
 
 
-def merge_paseo(path, settings, previous):
+def provider_update_names(include_peppy):
+    """Provider keys this installer writes into Paseo's configuration."""
+    return ("claude-codex", "claude-peppy") if include_peppy else ("claude-codex",)
+
+
+def provider_updates(settings, include_peppy):
+    builders = {"claude-codex": provider, "claude-peppy": peppy_provider}
+    return {name: builders[name](settings) for name in provider_update_names(include_peppy)}
+
+
+def merge_paseo(path, settings, previous, include_peppy):
     config = load_paseo(path)
     providers = config["agents"]["providers"]
-    if "claude-codex" in providers and str(path) != previous.get("paseo_config"):
-        raise SetupError(f"{path} already defines claude-codex; rename that provider before installing")
-    updated = provider(settings)
-    if providers.get("claude-codex") == updated:
+    updates = provider_updates(settings, include_peppy)
+    for name in updates:
+        if name in providers and str(path) != previous.get("paseo_config"):
+            raise SetupError(f"{path} already defines {name}; rename that provider before installing")
+    if all(providers.get(name) == updated for name, updated in updates.items()):
         return
-    providers["claude-codex"] = updated
+    providers.update(updates)
     backup(path)
     write_json(path, config)
 
 
 def write_launcher(path, command, environment=None, path_prepend=None):
     path = Path(path)
-    if path.exists() or path.is_symlink():
-        try:
-            owned = MARKER in path.read_text()
-        except (OSError, UnicodeError):
-            owned = False
-        if not owned:
-            raise SetupError(f"Refusing to overwrite an existing unrelated program: {path}")
+    if (path.exists() or path.is_symlink()) and not launcher_is_owned(path):
+        raise SetupError(f"Refusing to overwrite an existing unrelated program: {path}")
     lines = ["#!/bin/sh", MARKER]
     for name, value in (environment or {}).items():
         lines.append(f"export {name}={shlex.quote(str(value))}")
@@ -249,7 +292,7 @@ def add_path(bin_dir):
                       if (home_dir / name).exists()), home_dir / ".profile")
         profiles = [home_dir / ".bashrc", login]
     elif shell == "fish":
-        config_dir = absolute(os.environ.get("XDG_CONFIG_HOME", str(home_dir / ".config")))
+        config_dir = absolute(xdg_home("XDG_CONFIG_HOME", ".config"))
         target = config_dir / "fish" / "conf.d" / "claude-codex.fish"
         # POSIX single-quote escaping is also accepted by fish for ordinary paths.
         content = f"{MARKER}\nfish_add_path -- {shlex.quote(str(bin_dir))}\n"
@@ -369,13 +412,17 @@ def parser():
     p = argparse.ArgumentParser(description="Install claude-codex and CLIProxyAPI; configure Paseo only if detected")
     p.add_argument("--reasoning", choices=REASONING_MODES, help="Default reasoning level (first install: high)")
     p.add_argument("--port", type=int, help="Local proxy port (first install: 8317)")
-    p.add_argument("--config-dir", default=os.path.join(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")), "claude-codex"))
-    p.add_argument("--data-dir", default=os.path.join(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")), "claude-codex"))
-    p.add_argument("--state-dir", default=os.path.join(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")), "claude-codex"))
+    p.add_argument("--config-dir", default=default_dir("XDG_CONFIG_HOME", ".config", "claude-codex"))
+    p.add_argument("--data-dir", default=default_dir("XDG_DATA_HOME", ".local/share", "claude-codex"))
+    p.add_argument("--state-dir", default=default_dir("XDG_STATE_HOME", ".local/state", "claude-codex"))
     p.add_argument("--bin-dir", default=str(Path.home() / ".local/bin"))
     p.add_argument("--paseo-home", default=os.environ.get("PASEO_HOME", str(Path.home() / ".paseo")))
     p.add_argument("--claude-bin", help="Existing Claude executable to use")
     p.add_argument("--paseo-bin", help="Existing Paseo executable to use")
+    peppy = p.add_mutually_exclusive_group()
+    peppy.add_argument("--peppy-config-dir", help="Profile directory for the second Claude account (first install: ~/.claude-peppy)")
+    peppy.add_argument("--skip-peppy", action="store_true",
+                       help="Skip the second-account launcher and Paseo provider, retaining any existing ones")
     p.add_argument("--proxy-binary", help="Use an existing trusted CLIProxyAPI binary instead of downloading")
     p.add_argument("--proxy-version", default=PROXY_VERSION)
     p.add_argument("--device-login", action="store_true", help="Use ChatGPT device-code login")
@@ -413,39 +460,60 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     port = opts.port if opts.port is not None else previous.get("port", 8317)
     if not 1024 <= port <= 65535:
         raise SetupError("--port must be between 1024 and 65535")
+    use_peppy = not opts.skip_peppy
+    peppy_dir = absolute(opts.peppy_config_dir or previous.get("peppy_config_dir")
+                         or Path.home() / ".claude-peppy")
+    # The second account exists to be distinguishable from the primary profile,
+    # and must not silently share the installer's isolated gateway profile.
+    if use_peppy and peppy_dir in (absolute(Path.home() / ".claude"), absolute(config_dir / "claude")):
+        raise SetupError("--peppy-config-dir must not be the primary Claude profile ~/.claude "
+                         "or the installer's isolated Claude profile")
     detected_paseo = None if opts.skip_paseo else detect_paseo(opts.paseo_bin, previous.get("paseo_bin"), data_dir)
-    if detected_paseo and (Path(detected_paseo).name == "paseo-codex"
-                           or Path(detected_paseo).resolve() == (bin_dir / "paseo-codex").resolve()):
-        raise SetupError("--paseo-bin must point to the original Paseo executable")
+    if detected_paseo:
+        assert_original_binary(detected_paseo, bin_dir, ("paseo-codex",), "--paseo-bin", "Paseo")
     use_paseo = detected_paseo is not None
+    if use_peppy and not use_paseo and previous.get("peppy_config_dir"):
+        # A retained Paseo provider entry keeps pinning the old profile; moving
+        # the launcher without updating it would split live sessions from replay.
+        retained_config = Path(previous.get("paseo_config") or "")
+        if absolute(previous["peppy_config_dir"]) != peppy_dir and retained_config.is_file():
+            try:
+                retained = read_json(retained_config)
+                retained_providers = retained.get("agents", {}).get("providers", {})
+            except SetupError:
+                retained_providers = {}
+            if isinstance(retained_providers, dict) and "claude-peppy" in retained_providers:
+                raise SetupError("--peppy-config-dir changed, but this run leaves Paseo's configuration "
+                                 "untouched; rerun with Paseo detected so the claude-peppy provider entry "
+                                 "can be updated, or remove that entry first")
     if not use_paseo:
         say("Paseo integration skipped" if opts.skip_paseo else "Paseo not detected; skipping Paseo installation and configuration")
     paseo_home = absolute(opts.paseo_home)
     paseo_config = paseo_home / "config.json"
     if use_paseo:
         config = load_paseo(paseo_config)
-        if "claude-codex" in config["agents"]["providers"] and str(paseo_config) != previous.get("paseo_config"):
-            raise SetupError(f"{paseo_config} already has an unrelated claude-codex provider")
+        providers = config["agents"]["providers"]
+        for name in provider_update_names(use_peppy):
+            if name in providers and str(paseo_config) != previous.get("paseo_config"):
+                raise SetupError(f"{paseo_config} already has an unrelated {name} provider")
     for path in (config_dir, data_dir, state_dir, config_dir / "auth", config_dir / "claude"):
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         path.chmod(0o700)
+    if use_peppy:
+        # A profile the user already prepared keeps its own permissions.
+        peppy_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     bin_dir.mkdir(parents=True, exist_ok=True)
-    launcher_names = ["claude-codex", "claude-codex-proxy"] + (["paseo-codex"] if use_paseo else [])
+    launcher_names = ["claude-codex", "claude-codex-proxy"] + (["claude-peppy"] if use_peppy else []) \
+        + (["paseo-codex"] if use_paseo else [])
     for name in launcher_names:
         path = bin_dir / name
-        if path.exists() or path.is_symlink():
-            try:
-                owned = MARKER in path.read_text()
-            except (OSError, UnicodeError):
-                owned = False
-            if not owned:
-                raise SetupError(f"Refusing to overwrite unrelated program {path}")
+        if (path.exists() or path.is_symlink()) and not launcher_is_owned(path):
+            raise SetupError(f"Refusing to overwrite unrelated program {path}")
     # Validate before downloads, stopping services, or replacing configuration.
     plane_key = prepare_plane(opts, previous, config_dir, data_dir, plane_environment_key)
     paseo_patch = paseo_compat.prepare_patch(detected_paseo) if use_paseo else None
     claude_bin = resolve_cli("claude", opts.claude_bin, f"@anthropic-ai/claude-code@{CLAUDE_VERSION}", data_dir, previous.get("claude_bin"))
-    if Path(claude_bin).name == "claude-codex" or Path(claude_bin).resolve() == (bin_dir / "claude-codex").resolve():
-        raise SetupError("--claude-bin must point to the original Claude executable")
+    assert_original_binary(claude_bin, bin_dir, ("claude-codex", "claude-peppy"), "--claude-bin", "Claude")
     paseo_bin = detected_paseo
     if paseo_bin:
         say(f"Using installed Paseo: {paseo_bin}")
@@ -462,6 +530,11 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
         settings.update(paseo_bin=paseo_bin, paseo_config=str(paseo_config))
     elif previous.get("paseo_config"):
         settings.update(paseo_config=previous["paseo_config"], paseo_bin=previous.get("paseo_bin"))
+    if use_peppy:
+        settings["peppy_config_dir"] = str(peppy_dir)
+    elif previous.get("peppy_config_dir"):
+        # Keep an already-installed launcher working across a --skip-peppy run.
+        settings["peppy_config_dir"] = previous["peppy_config_dir"]
     if paseo_patch is not None:
         paseo_compat.apply_patch(paseo_patch, backup)
     # Stop only the previously managed process, using its old binary and port.
@@ -487,8 +560,10 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     python_bin = str(Path(sys.executable).absolute())
     for name, mode in (("claude-codex", "launch"), ("claude-codex-proxy", "proxy")):
         write_launcher(bin_dir / name, [python_bin, runtime_file, mode, settings_file])
+    if use_peppy:
+        write_launcher(bin_dir / "claude-peppy", [python_bin, runtime_file, "peppy", settings_file])
     if paseo_bin:
-        merge_paseo(paseo_config, settings, previous)
+        merge_paseo(paseo_config, settings, previous, use_peppy)
         paseo_env = {"PASEO_HOME": str(paseo_home)}
         write_launcher(bin_dir / "paseo-codex", [paseo_bin], paseo_env, path_prepend=settings["node_dir"])
     if not opts.no_path:
@@ -508,10 +583,14 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
         subprocess.run([paseo_bin, "reload"], env=env, check=True)
     say(f"Installed: {bin_dir / 'claude-codex'}")
     say(f"Run: {shlex.quote(str(bin_dir / 'claude-codex'))} --reasoning high")
+    if use_peppy:
+        say(f"Second account: {bin_dir / 'claude-peppy'} (profile {peppy_dir}); run it once to sign in.")
     if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
         say(f'For this terminal: export PATH={shlex.quote(str(bin_dir))}:"$PATH" (or open a new terminal)')
     if paseo_bin:
         say("In Paseo, select 'Claude Codex · GPT-6 Astra', then select a reasoning variant in the model picker.")
+        if use_peppy:
+            say("In Paseo, select 'Claude Peppy' to use the second Claude account.")
     if opts.skip_login:
         say("Installation staged; login and live verification were skipped. Run claude-codex-proxy login when ready.")
 

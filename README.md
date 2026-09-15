@@ -1,6 +1,6 @@
 # Claude Codex
 
-Run the **Claude Code harness with GPT-6 Astra**, using your ChatGPT subscription through CLIProxyAPI's Codex OAuth provider. A separate `claude-codex` command configures the proxy connection and reasoning level. The original `claude` executable and its user configuration stay in place.
+Run the **Claude Code harness with GPT-6 Astra**, using your ChatGPT subscription through CLIProxyAPI's Codex OAuth provider. A separate `claude-codex` command configures the proxy connection and reasoning level. The original `claude` executable and its user configuration stay in place. The same installer also sets up a **second, regular Claude Code account** — `claude-peppy`, profile `~/.claude-peppy` — for terminal use and as a distinguishable Paseo provider.
 
 Optionally adds a separate **Claude Codex · GPT-6 Astra** provider to an existing Paseo installation, with a provider-scoped compatibility patch for live context usage, forked-skill subagent tracking, and a permission-mode catalog without Claude's auto mode. Paseo is not required for terminal use. No particular Paseo version is assumed; the installer uses whichever Paseo executable you have.
 
@@ -16,6 +16,7 @@ This repository contains a **Python standard-library installer and launcher**, n
 
 - **`claude-codex`** launches Claude Code with Astra model mappings and the selected reasoning level, using an isolated user profile for terminal sessions. It starts the managed local proxy when needed.
 - **`claude-codex-proxy`** manages proxy startup/shutdown, login, diagnostics, and the persistent terminal reasoning default.
+- **`claude-peppy`** runs a **second, regular Claude Code account** in its own profile (`~/.claude-peppy`), separate from the primary `~/.claude` account, with ambient routing variables scrubbed so it always uses its own Anthropic login. Sign in once interactively; no proxy is involved.
 - **`paseo-codex`**, installed only when Paseo is detected, invokes your existing Paseo executable with the configured home. The generated provider uses `claude-codex` and a stream-JSON usage adapter for Paseo's context meter.
 
 The integration does not grant model access, bypass subscription limits, or make every native Claude feature available through the translated API. See the compatibility notes below.
@@ -46,13 +47,13 @@ Model access and usage limits come from the signed-in ChatGPT account, not a pro
 2. Selects the executable supplied with `--paseo-bin`, or the existing `paseo` on PATH. When PATH resolves only to the desktop app bundle, or to nothing, the executable selected by the previous install is reused if it still exists. **If none is available, skips all Paseo configuration and daemon operations.** No Paseo package is downloaded or version enforced; cached private copies from older installer runs are not selected automatically. `paseo-codex` invokes the detected executable.
 3. Downloads **CLIProxyAPI 7.2.155** and verifies a pinned SHA-256 checksum. Linux uses the static build without plugin support.
 4. Creates an isolated configuration, OAuth directory, random local API token, and Claude profile with private file permissions.
-5. Installs `claude-codex`, `claude-codex-proxy`, and (when Paseo is detected) `paseo-codex` into `~/.local/bin`, then adds that directory to your shell's startup configuration.
-6. When Paseo is detected, validates and backs up its Claude provider module, then applies the Claude-Codex-only compatibility patch: live context usage, forked-skill subagent tracking, and a mode catalog without auto mode. Also backs up and merges the new provider into `$PASEO_HOME/config.json` (default `~/.paseo/config.json`). Other providers and settings are preserved; unfamiliar or unwritable package layouts fail clearly rather than being patched blindly.
+5. Installs `claude-codex`, `claude-codex-proxy`, `claude-peppy`, and (when Paseo is detected) `paseo-codex` into `~/.local/bin`, then adds that directory to your shell's startup configuration.
+6. When Paseo is detected, validates and backs up its Claude provider module, then applies the compatibility patch: live context usage, forked-skill subagent tracking, a mode catalog without auto mode for the Claude Codex provider, and provider-scoped Claude profile resolution for history replay. Also backs up and merges the new providers into `$PASEO_HOME/config.json` (default `~/.paseo/config.json`). Other providers and settings are preserved; unfamiliar or unwritable package layouts fail clearly rather than being patched blindly.
 7. Offers a masked Plane token prompt, or reuses a saved/supplied token, and installs a private GET-only MCP connector for the `peppy` workspace. No additional packages are needed. Missing credentials in noninteractive/staged installs skip new Plane setup without blocking; existing connections are retained.
 8. Runs CLIProxyAPI's own ChatGPT OAuth login if needed, starts the local proxy, and sends a small Anthropic Messages request to Astra.
 9. When Paseo is detected, restarts the local Paseo daemon using that existing executable and reloads its configuration. Finish active Paseo sessions first, or pass `--skip-paseo-start` to activate it later.
 
-After updating the repository, run `./install.sh` again to copy the updated runtime, regenerate the installed launchers, and apply or verify the Paseo compatibility patch; editing this checkout alone does not update an existing installation. A Paseo package carrying the earlier usage-only patch is upgraded in place from its recovered upstream source. Reuse any custom directory options. The installer preserves the local API token and existing OAuth credentials. Rerunning stops the managed proxy and restarts Paseo when detected, so finish active sessions first. Existing unrelated programs called `claude-codex`, `claude-codex-proxy`, or `paseo-codex` are never overwritten. Explicit executable paths must point to the original programs, not these generated wrappers; self-referencing Claude and Paseo selections are rejected, including symlink aliases to the destination wrappers.
+After updating the repository, run `./install.sh` again to copy the updated runtime, regenerate the installed launchers, and apply or verify the Paseo compatibility patch; editing this checkout alone does not update an existing installation. A Paseo package carrying an earlier patch layout is upgraded in place from its recovered upstream source. Reuse any custom directory options. The installer preserves the local API token and existing OAuth credentials. Rerunning stops the managed proxy and restarts Paseo when detected, so finish active sessions first. Existing unrelated programs called `claude-codex`, `claude-codex-proxy`, `claude-peppy`, or `paseo-codex` are never overwritten. Explicit executable paths must point to the original programs, not these generated wrappers; self-referencing Claude and Paseo selections are rejected, including symlink aliases to the destination wrappers.
 
 Installers targeting the same configuration directory are serialized with `install.lock`. A second run waits until the first finishes or is interrupted, including any login and daemon-restart steps, so concurrent runs cannot mix their saved settings and proxy configuration. The usage-reader patch also has a package-local lock shared by installations using the same Paseo package. These locks are not crash rollback or general coordination between separate installations sharing other output directories. Do not delete a lock file to bypass a running installer.
 
@@ -110,6 +111,27 @@ The launcher therefore passes Claude's own `permissions.disableAutoMode` setting
 
 The proxy starts automatically on each launch if necessary, including after reboot. It remains running after a session exits. This is an on-demand background process, without a systemd/launchd service. If it crashes, the next launcher invocation starts it again; an already-running session may need a retry.
 
+## Second Claude account: `claude-peppy`
+
+`claude-peppy` runs a **second, regular Claude Code account** (a normal Anthropic login, not the Codex gateway) in its own profile, so it stays distinguishable from the primary account in `~/.claude`:
+
+```bash
+claude-peppy            # First run: sign in with the second account
+claude-peppy -p 'Explain this project'
+claude-peppy --resume
+```
+
+- The profile directory defaults to `~/.claude-peppy` (`--peppy-config-dir` to choose another; reruns keep a previously chosen directory). Its login, settings, skills, and session history live entirely there, and the installer never requires or performs a login for it. Run `claude-peppy` once interactively to sign in.
+- Claude Code arguments are forwarded untouched; there is no reasoning option, model remapping, or proxy. The primary account, the Codex gateway, and their settings are not read or modified.
+- **Environment isolation:** routing variables inherited from the surrounding shell or daemon (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` and the model-override variables, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, the Bedrock/Vertex/Foundry switches, and this integration's markers) are removed before launch, so ambient configuration cannot silently redirect the account or leak another provider's model selection. Proxy variables such as `HTTPS_PROXY`/`NO_PROXY` are kept, since the account talks to real Anthropic endpoints. Configure the account itself through `~/.claude-peppy/settings.json`.
+- When a Plane connection is configured, `claude-peppy` sessions receive the same private read-only **peppy** Plane MCP connector as `claude-codex` sessions, with the same `--strict-mcp-config` opt-out. The managed config is appended after your arguments (never before a prompt), and an existing `--mcp-config` group is extended rather than replaced.
+
+### The second account in Paseo
+
+When Paseo is detected, the installer also merges a **Claude Peppy** provider (`agents.providers.claude-peppy`) into `$PASEO_HOME/config.json`. It extends Paseo's regular Claude provider — the native model list, auto mode, WebSearch, and normal usage reporting all work — and differs only in the environment it launches with: `CLAUDE_CONFIG_DIR` pointing at the peppy profile. Select **Claude Peppy** when creating an agent to use the second account; the regular **Claude** provider keeps using the daemon's own profile.
+
+Paseo's daemon normally reloads an agent's transcript from the profile *it* resolves (`CLAUDE_CONFIG_DIR` or `~/.claude`), ignoring the environment of the provider it spawns. The compatibility patch therefore also makes transcript replay, the session-import list, and settings-discovered models honor a provider entry's own `CLAUDE_CONFIG_DIR`. Claude Peppy conversations survive daemon restarts and app reloads, and nothing is written into the primary profile. Providers that do not pin `CLAUDE_CONFIG_DIR` — including the regular Claude provider and Claude Codex — keep the upstream resolution. `--skip-peppy` skips the launcher and provider while preserving existing ones.
+
 ## Use with Paseo
 
 After installation, select the **Claude Codex · GPT-6 Astra** provider when creating an agent. The **model picker** lists the five Astra reasoning levels plus **GPT-6 Astra · Ultra Code**. The provider uses `extends: "claude"` and the absolute path to `claude-codex`, so the daemon does not depend on your interactive shell's PATH.
@@ -126,7 +148,7 @@ For the Claude Codex provider the patch declares a forked skill from its Skill c
 
 The context circle uses the last completed main-agent request's measured input and output tokens, including cached input, against the **1,050,000-token** window. It updates **between tool calls during a running turn**, not just when the agent finishes the entire turn. Before the first measured response arrives, usage is unknown; while the next request is running, the previous measurement stays visible. Text and tools still stream immediately. Totals from earlier turns and subagents are not added to the current context size.
 
-The launcher removes provisional input estimates. The installer also applies a compatibility patch to the selected Paseo package's Claude provider module (`agent.js`) so it accepts late input/cache counts and knows the configured window before the first turn ends, tracks forked-skill subagents, and offers the mode catalog described above. The added behavior is enabled only by the Claude Codex provider's `CLAUDE_CODEX_PASEO_USAGE` environment setting, which the installer writes into the provider entry; the regular Claude provider keeps its original behavior. The original module is backed up alongside it as `agent.js.claude-codex-backup-*`, its file permissions are preserved, and unchanged reinstallations do not duplicate the patch or backup. Source-structure and JavaScript syntax checks reject unsupported or modified modules before applying changes, and the sibling task protocol module is read to confirm the contract the patch extends; no Paseo version number is used to decide compatibility.
+The launcher removes provisional input estimates. The installer also applies a compatibility patch to the selected Paseo package's Claude provider module (`agent.js`) so it accepts late input/cache counts and knows the configured window before the first turn ends, tracks forked-skill subagents, offers the mode catalog described above, and resolves a provider entry's own `CLAUDE_CONFIG_DIR` for transcript replay, session import, and settings-discovered models (see "The second account in Paseo"). The usage, subagent, and mode-catalog behavior is enabled only by the Claude Codex provider's `CLAUDE_CODEX_PASEO_USAGE` environment setting, which the installer writes into the provider entry; profile resolution applies to any provider that pins `CLAUDE_CONFIG_DIR`, and the regular Claude provider keeps its original behavior. The original module is backed up alongside it as `agent.js.claude-codex-backup-*`, its file permissions are preserved, and unchanged reinstallations do not duplicate the patch or backup. Source-structure and JavaScript syntax checks reject unsupported or modified modules before applying changes, and the sibling task protocol module is read to confirm the contract the patch extends; no Paseo version number is used to decide compatibility.
 
 To repair an existing installation, finish active work and rerun `./install.sh` **on the daemon host** (with the same custom directory options, if any). The normal install restarts and reloads that daemon; resume or start an agent afterward to load the updated code. Reinstalling or updating Paseo can replace the patched module, so rerun this installer afterward as well. With `--skip-paseo-start`, explicitly run `paseo-codex daemon restart` and `paseo-codex reload` when ready. Restoring the module's backup, or reinstalling Paseo, removes the patch; restart the daemon after doing so.
 
@@ -177,6 +199,10 @@ bash install.sh --no-browser
 
 # Different local port and Paseo home.
 bash install.sh --port 18317 --paseo-home ~/.paseo-work
+
+# A different profile for the second Claude account, or none of it.
+bash install.sh --peppy-config-dir ~/.claude-work
+bash install.sh --skip-peppy
 
 # Choose existing executables explicitly.
 bash install.sh --claude-bin /path/to/claude --paseo-bin /path/to/paseo
@@ -261,6 +287,7 @@ Default files:
 | `~/.config/claude-codex/install.lock` | Persistent lock file used to serialize installers for this configuration |
 | `~/.config/claude-codex/auth/` | ChatGPT OAuth credentials |
 | `~/.config/claude-codex/claude/` | Isolated Claude user profile and sessions for terminal launches |
+| `~/.claude-peppy/` | Second Claude Code account profile used by `claude-peppy` and its Paseo provider |
 | `~/.local/share/claude-codex/` | Runtime, versioned proxy binary, optional private npm CLIs |
 | `~/.local/state/claude-codex/` | PID, lock, startup log, rotating CLIProxyAPI logs |
 | `~/.paseo/config.json` | Merged provider entry; timestamped backup beside it |
@@ -279,7 +306,7 @@ Troubleshooting:
 - **Paseo provider absent:** use `paseo-codex reload`, confirm app/daemon version and `PASEO_HOME`, then run the provider diagnostic above. If Paseo reports that a restart is required, restart its daemon after finishing active sessions.
 - **Paseo lists a subagent as working long after the agent went idle:** the daemon is running an unpatched or older-patched Claude provider module. Rerun the installer on the daemon host and restart the daemon; rows created before the fix are rebuilt from the transcripts on the next reload.
 - **A tool call was "denied by the Claude Code auto mode classifier":** the session predates this launcher's auto-mode setting or runs with `CLAUDE_CODEX_AUTO_MODE=1`. Start a new agent, or switch the existing one to another permission mode; see "Permission modes".
-- **Paseo shows an empty conversation for an existing agent:** the transcript is not in the profile the daemon reads. Rerun the installer and reload Paseo; see "Conversation history in Paseo" above. Sending one message to the agent moves an older transcript across, and the history returns after the next reload.
+- **Paseo shows an empty conversation for an existing agent:** the transcript is not in the profile the daemon reads. Rerun the installer and reload Paseo; see "Conversation history in Paseo" above. Sending one message to the agent moves an older transcript across, and the history returns after the next reload. For a **Claude Peppy** agent, this means the daemon is running an unpatched Claude provider module; rerun the installer on the daemon host and restart the daemon.
 - **Proxy startup failure:** inspect `~/.local/state/claude-codex/proxy-startup.log` and the `logs/` directory there. Avoid sharing credentials from config files.
 - **Unexpected routing:** inspect project `.claude/settings.json`, `.claude/settings.local.json`, and managed settings for conflicting model/provider environment variables.
 
@@ -288,9 +315,9 @@ This is a third-party compatibility bridge. Claude's server-side `WebSearch` is 
 ## Remove
 
 1. Finish active proxied sessions and installer runs, then run `claude-codex-proxy paths` to inspect this installation's locations and `claude-codex-proxy stop` to stop its proxy.
-2. If Paseo was configured, remove only `agents.providers.claude-codex` from its config and reload Paseo. Do not restore an old whole-file backup over newer unrelated edits. The compatibility patch is inactive without the provider marker; to remove it too, reinstall Paseo using your usual package manager and restart its daemon.
-3. Remove the generated `claude-codex` and `claude-codex-proxy` launchers, plus `paseo-codex` if installed. **Do not delete the bin directory itself**, your original Claude/Paseo executables, or the whole Paseo home.
-4. After reviewing the reported paths, remove only this integration's `config_dir`, `data_dir`, and `state_dir` when you no longer need the credentials or terminal session history they contain. This also removes any private Claude installation inside the integration's data directory. Paseo session transcripts live in the daemon's Claude profile and are not affected.
+2. If Paseo was configured, remove only `agents.providers.claude-codex` and `agents.providers.claude-peppy` from its config and reload Paseo. Do not restore an old whole-file backup over newer unrelated edits. The compatibility patch is inactive without the provider marker; to remove it too, reinstall Paseo using your usual package manager and restart its daemon.
+3. Remove the generated `claude-codex`, `claude-codex-proxy`, and `claude-peppy` launchers, plus `paseo-codex` if installed. **Do not delete the bin directory itself**, your original Claude/Paseo executables, or the whole Paseo home.
+4. After reviewing the reported paths, remove only this integration's `config_dir`, `data_dir`, and `state_dir` when you no longer need the credentials or terminal session history they contain. This also removes any private Claude installation inside the integration's data directory. Paseo session transcripts live in the daemon's Claude profile and are not affected. Remove `~/.claude-peppy` only if you no longer need the second account's login and history; it is not part of the integration's directories.
 5. Remove installer-marked PATH entries from shell startup files if desired, or the generated Fish `conf.d/claude-codex.fish` snippet. Keep shared PATH entries that you still need for other programs.
 
 ## Development and verification
@@ -312,7 +339,9 @@ Without integration environment variables, the real-binary tests are skipped. No
 - Live-usage cache accounting, request/compaction resets, malformed data, model switches, and unchanged native-provider behavior.
 - Forked-skill subagents against verbatim copies of Paseo's subagent modules: declaration from the Skill call, nesting of background children, no duplicate task card, completion and failure from the Skill result, nested forks, backgrounded-at-start children, replay facts linking the fork's transcript, and unchanged events for unmarked sessions.
 - The mode catalog and a running session's advertised modes with and without the provider marker and the override.
-- Patch source guards for every edited anchor, the read-only task protocol contract check, syntax validation, atomic backups, package locking, in-place upgrade of the earlier usage-only patch, and installation/reapplication without losing credentials or unrelated configuration.
+- Provider-scoped profile resolution: a provider entry's `CLAUDE_CONFIG_DIR` steers history replay, importable sessions, and settings-discovered models, launch-time overrides win, blank values fall back, and unmarked providers keep the upstream resolution.
+- The second-account launcher: native arguments forwarded in the scrubbed profile environment, appended Plane MCP injection around prompts, separators, strict mode, and probes, per-key provider merging, profile-directory round-trips, and wrapper recursion guards.
+- Patch source guards for every edited anchor, the read-only task protocol contract check, syntax validation, atomic backups, package locking, in-place upgrade of the earlier patch layouts, and installation/reapplication without losing credentials or unrelated configuration.
 
 Tests use temporary directories, mocks, and local subprocesses; they do not read your OAuth credentials or change your existing Claude/Paseo settings. To include real CLIProxyAPI translation tests against a **local fake upstream**:
 
@@ -334,9 +363,9 @@ The optional tests verify Anthropic streaming, reasoning translation, option-lik
 
 The Paseo tests copy the selected CLI/server package into temporary directories, install twice into that private copy, and start/stop their own daemon using temporary configuration and a temporary Claude profile. Client connections explicitly target their loopback test endpoint, with no fallback to your normal daemon. The existing installed package, daemon, and `~/.claude` are unaffected. Allow temporary disk space for a copy of your Paseo package and dependencies. No real Codex backend or subscription quota is used by these tests.
 
-All **118 tests passed**, with no skips, in development validation on Linux with CLIProxyAPI 7.2.155, Claude Code 2.1.266, and a private copy of the locally installed Paseo; the daemon tests upgraded that copy's earlier usage-only patch in place. macOS and live ChatGPT OAuth were not exercised by this validation; login failures are simulated in offline tests. Model entitlement remains account-dependent, and the installer's live smoke test checks that path after you sign in.
+All **118 tests passed**, with no skips, in development validation on Linux with CLIProxyAPI 7.2.155, Claude Code 2.1.266, and a private copy of the locally installed Paseo; the daemon tests upgraded that copy's earlier usage-only patch in place. macOS and live ChatGPT OAuth were not exercised by that validation; login failures are simulated in offline tests. Model entitlement remains account-dependent, and the installer's live smoke test checks that path after you sign in.
 
-The Plane changes were verified on macOS with Python 3.14.7 and 3.9.6: **168 tests passed; 15 optional real-binary integration tests were skipped** on each run. This includes an installed stdio MCP handshake and mocked Plane API requests, not live access to `peppy`. Temporary package fixtures resolve macOS's `/var` symlink before comparing filesystem paths.
+The Plane changes were verified on macOS with Python 3.14.7 and 3.9.6, and the second-account changes with Python 3.14.7: **205 tests passed, including all 16 optional real-binary integration tests** (Claude Code 2.1.270, CLIProxyAPI 7.2.155, and a private copy of the locally installed Paseo daemon). Offline runs skip those 16. The Paseo test drives the **Claude Peppy** provider end to end with a fake Claude binary that honors `CLAUDE_CONFIG_DIR`: the session records its transcript in the peppy profile, nothing lands in the daemon's primary profile, and the conversation replays after a daemon restart. Temporary package fixtures resolve macOS's `/var` symlink before comparing filesystem paths.
 
 ## Upstream references
 

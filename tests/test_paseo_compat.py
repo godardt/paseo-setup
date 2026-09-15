@@ -74,6 +74,17 @@ class PatchSourceTests(unittest.TestCase):
         with self.assertRaises(claude_codex.SetupError):
             paseo_compat.patch_source("export const unrelated = true;\n")
 
+    def test_an_unknown_profile_resolution_site_fails_closed(self):
+        # A future Paseo release may add a third profile resolution; patching
+        # around it would silently replay provider sessions from ~/.claude.
+        extra_site = ("    async extraImportable(options) {\n"
+                      + paseo_compat.PROFILE_CONFIG_DIR
+                      + "\n        return [];\n    }\n")
+        candidate = self.source.replace("    getAvailableModes() {", extra_site + "    getAvailableModes() {", 1)
+        self.assertEqual(candidate.count(paseo_compat.PROFILE_CONFIG_DIR), 3)
+        with self.assertRaisesRegex(claude_codex.SetupError, "profile resolution"):
+            paseo_compat.patch_source(candidate)
+
     def test_provider_environment_must_be_available_before_usage_construction(self):
         for assignment in ("this.runtimeSettings = options.runtimeSettings;",
                            "this.launchEnv = options.launchEnv;"):
@@ -117,6 +128,22 @@ class PatchSourceTests(unittest.TestCase):
         # A locally edited earlier patch is neither trusted nor upgraded blindly.
         for candidate in (previous.replace("this.codexLateUsage = launchEnv", "this.codexLateUsage = process.env", 1),
                           previous.replace(PATCHED_INITIALIZER, INITIALIZER, 1)):
+            with self.assertRaises(claude_codex.SetupError):
+                paseo_compat.patch_source(candidate)
+
+    def test_prior_installer_layout_is_upgraded_to_the_current_patch(self):
+        prior = self.source
+        for upstream, patched in paseo_compat.prior_replacements():
+            self.assertEqual(prior.count(upstream), 1, upstream[:60])
+            prior = prior.replace(upstream, patched, 1)
+        self.assertIn(paseo_compat.PATCH_MARKER, prior)
+        self.assertNotIn("claudeCodexProviderConfigDir", prior)
+        upgraded = paseo_compat.patch_source(prior)
+        self.assertEqual(upgraded, paseo_compat.patch_source(self.source))
+        self.assertEqual(paseo_compat.patch_source(upgraded), upgraded)
+        # A locally edited prior patch is neither trusted nor upgraded blindly.
+        for candidate in (prior.replace("this.codexLateUsage = launchEnv", "this.codexLateUsage = process.env", 1),
+                          prior.replace(PATCHED_INITIALIZER, INITIALIZER, 1)):
             with self.assertRaises(claude_codex.SetupError):
                 paseo_compat.patch_source(candidate)
 
@@ -699,6 +726,69 @@ class ReplayFactsTests(NodeFixtureTests):
 
 
 @unittest.skipUnless(NODE, "Node is required to syntax-check temporary package fixtures")
+class ProfileResolutionTests(NodeFixtureTests):
+    CLIENT = "new ClaudeAgentClient({logger: {child: () => ({})}, runtimeSettings: {env: providerEnv}})"
+
+    def test_provider_environment_directs_history_import_and_models(self):
+        self.run_js(f"""
+            const providerEnv = {{CLAUDE_CONFIG_DIR: '/tmp/peppy-profile'}};
+            const history = session('custom-model', providerEnv, {{}});
+            history.config.cwd = '/tmp/project';
+            const resolved = history.resolveHistoryPath('session-1');
+            assert.ok(resolved.startsWith(path.join('/tmp/peppy-profile', 'projects', '')), resolved);
+            assert.ok(resolved.endsWith('/session-1.jsonl'), resolved);
+            const client = {self.CLIENT};
+            assert.equal(await client.listImportableSessions({{cwd: '/tmp/project'}}), path.dirname(resolved));
+            assert.equal(await client.listImportableSessions(), path.join('/tmp/peppy-profile', 'projects'));
+            assert.equal((await client.fetchCatalog())[0].fromConfigDir, '/tmp/peppy-profile');
+        """)
+
+    def test_launch_environment_overrides_provider_settings_for_history(self):
+        self.run_js("""
+            const history = session('custom-model', {CLAUDE_CONFIG_DIR: '/provider-profile'},
+                                   {CLAUDE_CONFIG_DIR: '/launch-profile'});
+            history.config.cwd = '/tmp/project';
+            const resolved = history.resolveHistoryPath('session-1');
+            assert.ok(resolved.startsWith(path.join('/launch-profile', 'projects', '')), resolved);
+        """)
+
+    def test_unmarked_sessions_keep_upstream_profile_resolution(self):
+        self.run_js(f"""
+            const providerEnv = {{}};
+            const history = session('custom-model', providerEnv, {{}});
+            history.config.cwd = '/tmp/project';
+            const resolved = history.resolveHistoryPath('session-1');
+            assert.ok(resolved.startsWith(path.join(os.homedir(), '.claude', 'projects', '')), resolved);
+            const client = {self.CLIENT};
+            assert.equal(await client.listImportableSessions(), path.join(os.homedir(), '.claude', 'projects'));
+            assert.equal((await client.fetchCatalog())[0].fromConfigDir, null);
+            // A blank value falls back like upstream instead of resolving to ''.
+            const blank = session('custom-model', {{CLAUDE_CONFIG_DIR: '  '}}, {{}});
+            blank.config.cwd = '/tmp/project';
+            assert.ok(blank.resolveHistoryPath('session-1').startsWith(
+                path.join(os.homedir(), '.claude', 'projects', '')));
+        """)
+
+    def test_daemon_environment_remains_the_unmarked_fallback(self):
+        self.run_js(f"""
+            const providerEnv = {{}};
+            const history = session('custom-model', providerEnv, {{}});
+            history.config.cwd = '/tmp/project';
+            assert.ok(history.resolveHistoryPath('session-1').startsWith(
+                path.join('/daemon-env-profile', 'projects', '')));
+            const client = {self.CLIENT};
+            assert.equal((await client.fetchCatalog())[0].fromConfigDir, null);
+        """, process_env={"CLAUDE_CONFIG_DIR": "/daemon-env-profile"})
+
+    def test_original_fixture_ignores_provider_environment_for_history(self):
+        self.run_js("""
+            const history = session('custom-model', {CLAUDE_CONFIG_DIR: '/tmp/peppy-profile'}, {});
+            history.config.cwd = '/tmp/project';
+            const resolved = history.resolveHistoryPath('session-1');
+            assert.ok(!resolved.startsWith('/tmp/peppy-profile'), resolved);
+        """, transformed=False)
+
+
 class PatchFileTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="paseo-compat-offline-")

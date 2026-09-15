@@ -1,10 +1,14 @@
 // Offline representative of the installed Claude provider contract.
 // The usage helpers, original state class, mode catalog, replay fact readers,
-// and sidechain routing below are copied verbatim from installed source; the
-// subagent modules beside this file are verbatim copies too. Only the model
-// lookup, the legacy sidechain tracker, and the session wrapper are reduced;
-// every anchor the installer edits retains its original spelling.
+// sidechain routing, and the profile-resolution heads below are copied verbatim
+// from installed source; the subagent modules beside this file are verbatim
+// copies too. Only the model lookup, the legacy sidechain tracker, the session
+// wrapper, and the client wrapper are reduced; every anchor the installer edits
+// retains its original spelling.
 // No SDK, daemon, package installation, or credentials are required.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { ClaudeTaskProtocolSource, } from "./subagents/live-source.js";
 import { foldSubagentObservations } from "./subagents/observation.js";
 
@@ -378,6 +382,29 @@ class ClaudeAgentSession {
     buildSdkEnv() {
         return { ...process.env, ...this.runtimeSettings?.env, ...this.launchEnv };
     }
+    resolveHistoryPath(sessionId) {
+        const cwd = this.config.cwd;
+        if (!cwd)
+            return null;
+        const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+        const candidates = [cwd];
+        try {
+            const realCwd = fs.realpathSync(cwd);
+            if (realCwd !== cwd) {
+                candidates.push(realCwd);
+            }
+        }
+        catch {
+            // Fall back to the configured cwd when the path has already disappeared.
+        }
+        for (const candidate of candidates) {
+            const historyPath = path.join(claudeProjectDirSync(candidate, { configDir }), `${sessionId}.jsonl`);
+            if (fs.existsSync(historyPath)) {
+                return historyPath;
+            }
+        }
+        return path.join(claudeProjectDirSync(cwd, { configDir }), `${sessionId}.jsonl`);
+    }
     getAvailableModes() {
         return this.availableModes;
     }
@@ -595,6 +622,41 @@ function groupClaudeSidechainEntries(entries) {
         entriesByAgentId.set(entry.agentId, grouped);
     }
     return entriesByAgentId;
+}
+// Reduced stand-in for Claude Code's project-dir derivation; the installer
+// edits only the configDir it is given.
+function claudeProjectDirSync(cwd, { configDir }) {
+    const name = String(cwd).replace(/[^a-zA-Z0-9]+/g, "-");
+    return path.join(configDir, "projects", name);
+}
+// Reduced model catalog: reports the config dir it was resolved with.
+function getClaudeModelsWithSettings(logger, configDir, claudeCodeVersion) {
+    return Promise.resolve([{ id: "native-model", fromConfigDir: configDir ?? null, version: claudeCodeVersion }]);
+}
+// Reduced client wrapper: the profile-resolution call sites keep their
+// original spelling; only the scanning and catalog bodies are reduced.
+const CLAUDE_CAPABILITIES = {};
+export class ClaudeAgentClient {
+    constructor(options) {
+        this.provider = "claude";
+        this.capabilities = CLAUDE_CAPABILITIES;
+        this.defaults = options.defaults;
+        this.logger = options.logger.child({ module: "agent", provider: "claude" });
+        this.runtimeSettings = options.runtimeSettings;
+        this.configDir = options.configDir;
+    }
+    async listImportableSessions(options) {
+        const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+        // Reduced: report the resolved sessions root instead of scanning it.
+        return options?.cwd
+            ? claudeProjectDirSync(options.cwd, { configDir })
+            : path.join(configDir, "projects");
+    }
+    async fetchCatalog(context) {
+        const claudeCodeVersion = "fixture";
+        const models = await getClaudeModelsWithSettings(this.logger, this.configDir, claudeCodeVersion);
+        return models;
+    }
 }
 
 export { ClaudeContextUsageState, ClaudeAgentSession, claudeModeCatalog, readClaudeReplayParentFacts, DEFAULT_MODES };
