@@ -1,12 +1,12 @@
-"""Install a provider-scoped compatibility adapter into the selected Paseo package.
+"""Legacy source patch for the selected Paseo package's Claude provider module.
 
-The adapter gives the Claude Codex provider live context usage, subagent
-tracking for forked skills, and a mode catalog without Claude's auto mode.
-It also resolves Claude profiles from a provider entry's own CLAUDE_CONFIG_DIR
-for history replay, importable sessions, and settings-discovered models, so a
-provider such as the installer's second account keeps its own transcripts,
-and relabels that provider's model options from its own label-prefix marker.
-Paseo's regular Claude provider keeps its original behavior.
+The installer no longer applies this patch by default: it edits Paseo's built
+output by exact string matching, so any Paseo release can stop it applying.
+The default installation restores a module carrying the patch to its upstream
+source and relies on configuration and the Paseo plugin instead. With
+--paseo-patch the adapter is applied as before: live context usage, subagent
+tracking for forked skills, and a mode catalog without Claude's auto mode for
+the Claude Codex provider, plus provider-scoped Claude profile resolution.
 """
 
 import os
@@ -235,6 +235,22 @@ def replacements():
     )
 
 
+def recover_upstream(source):
+    """Return the upstream source behind any layout this installer ever wrote.
+
+    Unpatched source is returned unchanged. A marker without a recognized
+    complete layout is reported as an error rather than guessed at.
+    """
+    if PATCH_MARKER not in source:
+        return source
+    for layout in (replacements(), *superseded_layouts()):
+        original = reverse_edits(source, layout)
+        if original is not None:
+            return original
+    raise SetupError("Paseo's claude-codex compatibility patch is incomplete or modified; "
+                     "restore its agent.js.claude-codex-backup-* copy or reinstall Paseo, then rerun ./install.sh")
+
+
 def profiles_unresolved(source):
     """An unpatched Claude profile resolution remains; patched sites rewrite it.
 
@@ -390,3 +406,33 @@ def apply_patch(path, backup):
     except OSError as exc:
         raise SetupError(f"Cannot apply Paseo compatibility to {path}: {exc}. "
                          "Use a user-writable Paseo installation and rerun ./install.sh") from exc
+
+
+def restore_upstream(paseo_bin, backup):
+    """Remove this installer's patch from the selected package, if present.
+
+    Returns True when the module was rewritten. Packages this installer cannot
+    inspect, such as the desktop app bundle, never carried the patch and are
+    skipped. An unrelated or modified patch is reported without changes.
+    """
+    try:
+        path = find_usage_reader(paseo_bin)
+    except SetupError:
+        say("Paseo's Claude provider module was not inspected for an earlier compatibility patch: "
+            "the selected executable is not an npm-installed package this installer recognizes, "
+            "so it cannot carry one.")
+        return False
+    try:
+        with file_lock(path.with_name(".claude-codex-usage.lock")):
+            source = path.read_text()
+            restored = recover_upstream(source)
+            if restored == source:
+                return False
+            check_syntax(restored)
+            mode = path.stat().st_mode & 0o777
+            backup(path)
+            atomic_write(path, restored, mode=mode)
+    except OSError as exc:
+        raise SetupError(f"Cannot restore Paseo's Claude provider module {path}: {exc}") from exc
+    say(f"Removed the earlier claude-codex compatibility patch; upstream source restored: {path}")
+    return True

@@ -21,11 +21,16 @@ import time
 import paseo_compat
 import plane_mcp
 from claude_codex import (
-    CONTEXT_WINDOW, EFFORTS, REASONING_MODES, ULTRACODE_MODEL, MARKER, MODEL, Runtime, SetupError, atomic_write, model_id,
-    file_lock, proxy_config, read_json, say, write_json,
+    CONTEXT_WINDOW, EFFORTS, REASONING_MODES, ULTRACODE_MODEL, MARKER, MODEL, PASEO_MARKER, PEPPY_PASEO_MARKER,
+    Runtime, SetupError, atomic_write, model_id, file_lock, proxy_config, read_json, say, write_json,
 )
 
 PROXY_VERSION = "7.2.155"
+# The Paseo plugin shipped in this repository; installed as a directory plugin
+# from a private copy so the checkout can move or be removed afterwards.
+PLUGIN_ID = "claude-codex"
+PLUGIN_SOURCE = Path(__file__).with_name("paseo_plugin")
+PLUGIN_FILES = ("paseo-plugin.json", "index.server.ts", "package.json")
 CLAUDE_VERSION = "2.1.246"
 # Published release checksums, pinned along with the default version.
 CHECKSUMS = {
@@ -195,7 +200,7 @@ def provider(settings):
             # The launcher replaces this placeholder with the private local key.
             "ANTHROPIC_AUTH_TOKEN": "provided-by-claude-codex-launcher",
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(CONTEXT_WINDOW),
-            "CLAUDE_CODEX_PASEO_USAGE": "1",
+            PASEO_MARKER: "1",
         },
         "disallowedTools": ["WebSearch"],
         "models": [{
@@ -221,18 +226,31 @@ def peppy_provider(settings):
     return {
         "extends": "claude",
         "label": "Claude Peppy",
-        "description": "Second Claude Code account in its own profile",
+        "description": "Second Claude Code account, selected by its own long-lived token",
         "command": [str(Path(settings["bin_dir"]) / "claude-peppy")],
         "enabled": True,
-        # The compatibility patch makes the daemon read this profile for an
-        # agent's transcripts, importable sessions, and settings-discovered
-        # models; Claude itself always runs in it. The label prefix relabels
-        # this provider's model options in Paseo's picker, keeping native ids.
-        "env": {
-            "CLAUDE_CONFIG_DIR": settings["peppy_config_dir"],
-            "CLAUDE_CODEX_MODEL_LABEL_PREFIX": "Peppy",
-        },
+        # No CLAUDE_CONFIG_DIR: Paseo reloads transcripts from the profile its
+        # daemon resolves, so the launcher runs Paseo sessions there and selects
+        # the account with the saved token instead (never written into Paseo's
+        # configuration; the marker tells the launcher it was started by Paseo).
+        "env": {PEPPY_PASEO_MARKER: "1"},
     }
+
+
+def plugin_entry(data_dir):
+    return {"source": "directory", "path": str(Path(data_dir) / "paseo-plugin"), "enabled": True}
+
+
+def install_plugin_files(data_dir):
+    """Copy the repository's Paseo plugin into the data directory."""
+    target = Path(data_dir) / "paseo-plugin"
+    target.mkdir(parents=True, exist_ok=True)
+    for name in PLUGIN_FILES:
+        atomic_write(target / name, (PLUGIN_SOURCE / name).read_text(), mode=0o644)
+    for stale in target.iterdir():
+        if stale.name not in PLUGIN_FILES and stale.is_file():
+            stale.unlink()
+    return target
 
 
 def load_paseo(path):
@@ -258,6 +276,20 @@ def provider_updates(settings, include_peppy):
     return {name: builders[name](settings) for name in provider_update_names(include_peppy)}
 
 
+def plugin_conflict(config, path, settings, previous):
+    plugins = config.get("plugins")
+    if plugins is not None and not isinstance(plugins, dict):
+        raise SetupError(f"plugins must be an object in {path}")
+    existing = (plugins or {}).get(PLUGIN_ID)
+    if existing is None or existing == plugin_entry(settings["data_dir"]):
+        return
+    if str(path) == previous.get("paseo_config") and isinstance(existing, dict) \
+            and existing.get("path") == plugin_entry(previous.get("data_dir", settings["data_dir"]))["path"]:
+        return
+    raise SetupError(f"{path} already configures an unrelated plugin named {PLUGIN_ID}; "
+                     "remove it (paseo plugin remove claude-codex) before installing")
+
+
 def merge_paseo(path, settings, previous, include_peppy):
     config = load_paseo(path)
     providers = config["agents"]["providers"]
@@ -265,9 +297,22 @@ def merge_paseo(path, settings, previous, include_peppy):
     for name in updates:
         if name in providers and str(path) != previous.get("paseo_config"):
             raise SetupError(f"{path} already defines {name}; rename that provider before installing")
-    if all(providers.get(name) == updated for name, updated in updates.items()):
+    plugin_conflict(config, path, settings, previous)
+    plugins = config.get("plugins") or {}
+    entry = plugin_entry(settings["data_dir"])
+    existing = plugins.get(PLUGIN_ID)
+    if isinstance(existing, dict) and existing.get("enabled") is False:
+        # A deliberate `paseo plugin disable claude-codex` survives reruns.
+        entry["enabled"] = False
+    if all(providers.get(name) == updated for name, updated in updates.items()) \
+            and config.get("pluginsEnabled") is True and plugins.get(PLUGIN_ID) == entry:
         return
     providers.update(updates)
+    if config.get("pluginsEnabled") is not True:
+        say("Enabling Paseo plugins (pluginsEnabled) for the claude-codex plugin.")
+        config["pluginsEnabled"] = True
+    plugins[PLUGIN_ID] = entry
+    config["plugins"] = plugins
     backup(path)
     write_json(path, config)
 
@@ -396,6 +441,38 @@ def prepare_plane(opts, previous, config_dir, data_dir, environment_key):
     return plane_mcp.validate_api_key(value) if value.strip() else None
 
 
+def validate_oauth_token(value):
+    token = value.strip()
+    if not token or any(char.isspace() or not char.isprintable() for char in token):
+        raise SetupError("The second account's token must be a single line of printable characters "
+                         "as printed by claude setup-token")
+    return token
+
+
+def prepare_peppy_token(opts, previous, environment_token):
+    """Select the second account's long-lived token without writing files."""
+    if opts.peppy_oauth_token_file:
+        try:
+            value = absolute(opts.peppy_oauth_token_file).read_text()
+        except (OSError, UnicodeError):
+            raise SetupError("Cannot read --peppy-oauth-token-file; provide a UTF-8 file containing only the token") from None
+        return validate_oauth_token(value)
+    if environment_token is not None:
+        return validate_oauth_token(environment_token)
+    if previous.get("peppy_oauth_token"):
+        return previous["peppy_oauth_token"]
+    if opts.skip_login or not sys.stdin.isatty():
+        return None
+    say("Paseo runs the second account's sessions in the daemon's Claude profile and selects the")
+    say("account with a long-lived token. Generate one with: claude-peppy setup-token")
+    say("The token stays in this installation's private settings; it is not written into Paseo's configuration.")
+    try:
+        value = masked_input("Second account token from claude setup-token (masked with *; Enter to skip): ")
+    except (EOFError, OSError, ValueError, termios.error):
+        raise SetupError("Cannot read a masked token; use --peppy-oauth-token-file or CLAUDE_PEPPY_OAUTH_TOKEN") from None
+    return validate_oauth_token(value) if value.strip() else None
+
+
 def configure_plane(config_dir, data_dir, api_key):
     credentials = config_dir / "plane-credentials.json"
     helper = data_dir / "plane_mcp.py"
@@ -427,6 +504,9 @@ def parser():
     peppy.add_argument("--peppy-config-dir", help="Profile directory for the second Claude account (first install: ~/.claude-peppy)")
     peppy.add_argument("--skip-peppy", action="store_true",
                        help="Skip the second-account launcher and Paseo provider, retaining any existing ones")
+    p.add_argument("--peppy-oauth-token-file",
+                   help="File containing the second account's long-lived token from claude setup-token, "
+                        "used for its Paseo sessions (or set CLAUDE_PEPPY_OAUTH_TOKEN)")
     p.add_argument("--proxy-binary", help="Use an existing trusted CLIProxyAPI binary instead of downloading")
     p.add_argument("--proxy-version", default=PROXY_VERSION)
     p.add_argument("--device-login", action="store_true", help="Use ChatGPT device-code login")
@@ -438,6 +518,9 @@ def parser():
     p.add_argument("--skip-smoke-test", action="store_true", help="Skip the small live Astra verification request")
     p.add_argument("--skip-paseo", action="store_true", help="Install terminal integration only")
     p.add_argument("--skip-paseo-start", action="store_true", help="Write Paseo configuration without restarting its daemon")
+    p.add_argument("--paseo-patch", action="store_true",
+                   help="Also apply the legacy source patch to Paseo's Claude provider module (version-specific; "
+                        "off by default, and an earlier patch is removed without it)")
     p.add_argument("--no-path", action="store_true", help="Do not edit shell startup files")
     return p
 
@@ -445,6 +528,7 @@ def parser():
 def install(opts):
     # Input credentials must not be inherited by npm, the proxy, or the daemon.
     plane_environment_key = os.environ.pop("PLANE_API_KEY", None)
+    peppy_environment_token = os.environ.pop("CLAUDE_PEPPY_OAUTH_TOKEN", None)
     if sys.version_info < (3, 9):
         raise SetupError("Python 3.9+ is required")
     if sys.platform not in ("linux", "darwin"):
@@ -455,10 +539,11 @@ def install(opts):
         absolute(getattr(opts, key)) for key in ("config_dir", "data_dir", "state_dir", "bin_dir")
     )
     with file_lock(config_dir / "install.lock"):
-        return _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_environment_key)
+        return _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_environment_key,
+                               peppy_environment_token)
 
 
-def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_environment_key):
+def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_environment_key, peppy_environment_token):
     settings_file = config_dir / "settings.json"
     previous = read_json(settings_file) if settings_file.exists() else {}
     port = opts.port if opts.port is not None else previous.get("port", 8317)
@@ -515,7 +600,11 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
             raise SetupError(f"Refusing to overwrite unrelated program {path}")
     # Validate before downloads, stopping services, or replacing configuration.
     plane_key = prepare_plane(opts, previous, config_dir, data_dir, plane_environment_key)
-    paseo_patch = paseo_compat.prepare_patch(detected_paseo) if use_paseo else None
+    peppy_token = prepare_peppy_token(opts, previous, peppy_environment_token) if use_peppy else None
+    paseo_patch = paseo_compat.prepare_patch(detected_paseo) if use_paseo and opts.paseo_patch else None
+    if use_paseo and use_peppy and not peppy_token:
+        say("No token for the second account's Paseo sessions yet; the Claude Peppy provider will refuse to "
+            "start sessions until one is saved (claude-peppy setup-token, then rerun ./install.sh).")
     claude_bin = resolve_cli("claude", opts.claude_bin, f"@anthropic-ai/claude-code@{CLAUDE_VERSION}", data_dir, previous.get("claude_bin"))
     assert_original_binary(claude_bin, bin_dir, ("claude-codex", "claude-peppy"), "--claude-bin", "Claude")
     paseo_bin = detected_paseo
@@ -536,11 +625,17 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
         settings.update(paseo_config=previous["paseo_config"], paseo_bin=previous.get("paseo_bin"))
     if use_peppy:
         settings["peppy_config_dir"] = str(peppy_dir)
+        if peppy_token:
+            settings["peppy_oauth_token"] = peppy_token
     elif previous.get("peppy_config_dir"):
         # Keep an already-installed launcher working across a --skip-peppy run.
         settings["peppy_config_dir"] = previous["peppy_config_dir"]
+        if previous.get("peppy_oauth_token"):
+            settings["peppy_oauth_token"] = previous["peppy_oauth_token"]
     if paseo_patch is not None:
         paseo_compat.apply_patch(paseo_patch, backup)
+    elif use_paseo:
+        paseo_compat.restore_upstream(paseo_bin, backup)
     # Stop only the previously managed process, using its old binary and port.
     if previous:
         Runtime(previous).stop()
@@ -567,6 +662,7 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     if use_peppy:
         write_launcher(bin_dir / "claude-peppy", [python_bin, runtime_file, "peppy", settings_file])
     if paseo_bin:
+        install_plugin_files(data_dir)
         merge_paseo(paseo_config, settings, previous, use_peppy)
         paseo_env = {"PASEO_HOME": str(paseo_home)}
         write_launcher(bin_dir / "paseo-codex", [paseo_bin], paseo_env, path_prepend=settings["node_dir"])
@@ -589,13 +685,15 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     say(f"Run: {shlex.quote(str(bin_dir / 'claude-codex'))} --reasoning high")
     if use_peppy:
         say(f"Second account: {bin_dir / 'claude-peppy'} (profile {peppy_dir}); run it once to sign in.")
+        if paseo_bin and not peppy_token:
+            say("For Paseo: run claude-peppy setup-token, then rerun ./install.sh and paste the token.")
     if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
         say(f'For this terminal: export PATH={shlex.quote(str(bin_dir))}:"$PATH" (or open a new terminal)')
     if paseo_bin:
         say("In Paseo, select 'Claude Codex · GPT-6 Astra', then select a reasoning variant in the model picker.")
         if use_peppy:
-            say("In Paseo, select 'Claude Peppy' to use the second Claude account; "
-                "its model options are labeled with a Peppy prefix.")
+            say("In Paseo, select 'Claude Peppy' to use the second Claude account.")
+        say("Paseo plugin 'claude-codex' installed; check it with: paseo-codex plugin ls")
     if opts.skip_login:
         say("Installation staged; login and live verification were skipped. Run claude-codex-proxy login when ready.")
 

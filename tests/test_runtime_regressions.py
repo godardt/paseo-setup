@@ -326,7 +326,8 @@ class PlaneMcpLaunchTests(unittest.TestCase):
             for mode in ("terminal", "paseo"):
                 for configured in (False, True):
                     for args in (["--version"], ["-v"], ["--help"], ["-h"],
-                                 ["auth", "status"], ["auth", "status", "--json"]):
+                                 ["auth", "status"], ["auth", "status", "--json"],
+                                 ["setup-token"], ["mcp", "list"], ["plugin", "list"], ["update"]):
                         with self.subTest(mode=mode, configured=configured, args=args):
                             settings = dict(self.settings)
                             if not configured:
@@ -407,6 +408,37 @@ class PeppyProfileTests(unittest.TestCase):
         for name in scrubbed:
             self.assertNotIn(name, env, name)
 
+    def test_paseo_launches_use_the_daemon_profile_and_the_saved_token(self):
+        settings = {**self.settings, "peppy_oauth_token": "sk-ant-oat01-saved", "config_dir": "/private/config"}
+        marked = {"CLAUDE_PEPPY_PASEO": "1", "CLAUDE_CODE_OAUTH_TOKEN": "ambient", "ANTHROPIC_API_KEY": "ambient",
+                  "PATH": "/usr/bin"}
+        env = runtime.peppy_env(settings, marked)
+        self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-saved")
+        self.assertNotIn("CLAUDE_CONFIG_DIR", env)
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        # A pinned profile from an older provider entry is dropped; the daemon's own is kept.
+        for pinned in ("/private/claude-peppy", "/private/config/claude"):
+            self.assertNotIn("CLAUDE_CONFIG_DIR", runtime.peppy_env(settings, {**marked, "CLAUDE_CONFIG_DIR": pinned}))
+        daemon = runtime.peppy_env(settings, {**marked, "CLAUDE_CONFIG_DIR": "/daemon/claude"})
+        self.assertEqual(daemon["CLAUDE_CONFIG_DIR"], "/daemon/claude")
+        # Terminal launches are unchanged: own profile, no token from anywhere.
+        terminal = runtime.peppy_env(settings, {"CLAUDE_CODE_OAUTH_TOKEN": "ambient", "PATH": "/usr/bin"})
+        self.assertEqual(terminal["CLAUDE_CONFIG_DIR"], "/private/claude-peppy")
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", terminal)
+        for value in ("0", "", "yes"):
+            self.assertEqual(runtime.peppy_env(settings, {"CLAUDE_PEPPY_PASEO": value, "PATH": "/usr/bin"})
+                             ["CLAUDE_CONFIG_DIR"], "/private/claude-peppy")
+
+    def test_paseo_launch_without_a_saved_token_fails_instead_of_using_the_daemon_login(self):
+        for settings in (self.settings, {**self.settings, "peppy_oauth_token": ""}):
+            with self.assertRaisesRegex(runtime.SetupError, "claude-peppy setup-token"):
+                runtime.peppy_env(settings, {"CLAUDE_PEPPY_PASEO": "1", "PATH": "/usr/bin"})
+        with patch.object(runtime.os, "execve") as execute, \
+             patch.dict(os.environ, {"CLAUDE_PEPPY_PASEO": "1"}):
+            with self.assertRaises(runtime.SetupError):
+                runtime.launch_peppy(self.settings, ["-p", "Hi"])
+        execute.assert_not_called()
+
     def test_launch_forwards_arguments_and_requires_saved_settings(self):
         with patch.object(runtime.os, "execve") as execute:
             runtime.launch_peppy(self.settings, ["--settings", '{"env": {}}', "-p"])
@@ -414,11 +446,17 @@ class PeppyProfileTests(unittest.TestCase):
         self.assertEqual(binary, "/private/bin/claude")
         self.assertEqual(forwarded, [binary, "--settings", '{"env": {}}', "-p", "--mcp-config", self.PATH])
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/private/claude-peppy")
-        for args in (["--version"], ["-v"], ["--help"], ["-h"], ["auth", "status"]):
+        for args in (["--version"], ["-v"], ["--help"], ["-h"], ["auth", "status"], ["setup-token"],
+                     ["mcp", "list"], ["auth", "login"], ["doctor"]):
             with self.subTest(args=args):
                 with patch.object(runtime.os, "execve") as execute:
                     runtime.launch_peppy(self.settings, args)
                 self.assertEqual(execute.call_args.args[1], [self.settings["claude_bin"], *args])
+        # A bare first word that is not a Claude command is a prompt and keeps the connector.
+        with patch.object(runtime.os, "execve") as execute:
+            runtime.launch_peppy(self.settings, ["setup", "my token"])
+        self.assertEqual(execute.call_args.args[1],
+                         [self.settings["claude_bin"], "setup", "my token", "--mcp-config", self.PATH])
         for settings in ({"claude_bin": "/private/bin/claude"}, {"peppy_config_dir": "/private/claude-peppy"}):
             with self.subTest(settings=sorted(settings)):
                 with self.assertRaises(runtime.SetupError):
@@ -472,6 +510,33 @@ class PaseoTranscriptTests(unittest.TestCase):
             runtime.adopt_isolated_transcript(settings, ["-p", "Hi"], env)
             runtime.adopt_isolated_transcript(settings, args, {"CLAUDE_CONFIG_DIR": str(base / "config" / "claude")})
             self.assertEqual((source / f"{self.SESSION}.jsonl").read_text(), "stale\n")
+
+    def test_resumed_second_account_session_moves_from_its_own_profile(self):
+        with tempfile.TemporaryDirectory(prefix="claude-codex-transcript-test-") as temp:
+            base = Path(temp)
+            settings = {"config_dir": str(base / "config"), "claude_bin": "/private/bin/claude",
+                        "peppy_config_dir": str(base / "peppy"), "peppy_oauth_token": "sk-ant-oat01-saved"}
+            project = "-home-user-project"
+            source = base / "peppy" / "projects" / project
+            source.mkdir(parents=True)
+            (source / f"{self.SESSION}.jsonl").write_text('{"type":"user"}\n')
+            env = {"CLAUDE_PEPPY_PASEO": "1", "CLAUDE_CONFIG_DIR": str(base / "daemon"), "PATH": "/usr/bin"}
+            args = ["--resume", self.SESSION, "--output-format", "stream-json"]
+            with patch.object(runtime.os, "execve") as execute, patch.dict(os.environ, env, clear=True):
+                runtime.launch_peppy(settings, args)
+            binary, forwarded, launched = execute.call_args.args
+            self.assertEqual((binary, forwarded), ("/private/bin/claude", ["/private/bin/claude", *args]))
+            self.assertEqual(launched["CLAUDE_CONFIG_DIR"], str(base / "daemon"))
+            self.assertEqual(launched["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-saved")
+            target = base / "daemon" / "projects" / project / f"{self.SESSION}.jsonl"
+            self.assertEqual(target.read_text(), '{"type":"user"}\n')
+            self.assertFalse((source / f"{self.SESSION}.jsonl").exists())
+            # Terminal launches never move anything.
+            (source / f"{self.SESSION}.jsonl").write_text("terminal\n")
+            with patch.object(runtime.os, "execve"), patch.dict(os.environ, {"PATH": "/usr/bin"}, clear=True):
+                runtime.launch_peppy(settings, args)
+            self.assertEqual((source / f"{self.SESSION}.jsonl").read_text(), "terminal\n")
+            self.assertEqual(target.read_text(), '{"type":"user"}\n')
 
     def test_daemon_profile_defaults_to_home_claude(self):
         with tempfile.TemporaryDirectory(prefix="claude-codex-transcript-test-") as temp:

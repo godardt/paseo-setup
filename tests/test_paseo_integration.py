@@ -119,12 +119,14 @@ from pathlib import Path
 # The SDK delivers the prompt over stdin; answer without depending on it.
 threading.Thread(target=sys.stdin.read, daemon=True).start()
 args = sys.argv[1:]
-profile = Path(os.environ["CLAUDE_CONFIG_DIR"])
+profile = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 profile.mkdir(parents=True, exist_ok=True)
 if "--version" in args or "-v" in args:
     print("2.1.246 (Claude Code)")
     raise SystemExit(0)
-(profile / "spawn-report.json").write_text(json.dumps({"args": args, "config": str(profile), "cwd": os.getcwd()}))
+(profile / "spawn-report.json").write_text(json.dumps({
+    "args": args, "config": os.environ.get("CLAUDE_CONFIG_DIR"), "cwd": os.getcwd(),
+    "token": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), "marker": os.environ.get("CLAUDE_PEPPY_PASEO")}))
 if args[:2] == ["auth", "status"]:
     print(json.dumps({"type": "auth", "loggedIn": True, "account": "peppy"}))
     raise SystemExit(0)
@@ -211,12 +213,15 @@ class PaseoIntegrationTests(unittest.TestCase):
         self.run_paseo_session("max", check_usage=True)
 
     def test_context_meter_updates_between_tools_during_first_running_turn(self):
-        self.run_paseo_session("max", check_live_usage=True)
+        self.run_paseo_session("max", check_live_usage=True, paseo_patch=True)
 
     def test_forked_skill_subagents_finish_live_and_after_daemon_restart(self):
-        self.run_paseo_session("high", check_forked_skill=True)
+        self.run_paseo_session("high", check_forked_skill=True, paseo_patch=True)
 
     def test_auto_mode_is_not_offered_and_falls_back_to_prompting(self):
+        self.run_paseo_session("high", check_auto_mode=True, paseo_patch=True)
+
+    def test_plugin_keeps_new_agents_out_of_auto_mode_without_the_patch(self):
         self.run_paseo_session("high", check_auto_mode=True)
 
     def isolated_daemon_environment(self, base):
@@ -261,8 +266,8 @@ class PaseoIntegrationTests(unittest.TestCase):
             "--skip-login", "--skip-paseo-start", "--no-path", *extra,
         ]
 
-    def test_peppy_provider_sessions_use_their_own_profile(self):
-        """The second account runs in its profile and replays from it after restarts."""
+    def test_peppy_provider_sessions_use_the_daemon_profile_with_the_saved_token(self):
+        """The second account is selected by its token; history replays from the daemon's profile."""
         with tempfile.TemporaryDirectory(prefix="claude-codex-peppy-") as temp:
             base = Path(temp)
             private_root = base / "private-paseo-cli"
@@ -273,16 +278,17 @@ class PaseoIntegrationTests(unittest.TestCase):
             fake_claude.write_text(f"#!{sys.executable}\n" + FAKE_PEPPY_CLAUDE)
             fake_claude.chmod(0o755)
             peppy_profile = base / "claude-peppy"
-            # The installer resolves directories; macOS tempdirs sit behind /var.
-            resolved_peppy = peppy_profile.resolve()
+            token_file = base / "peppy-token.txt"
+            token_file.write_text("sk-ant-oat01-integration-test\n")
             install_command = self.install_command(base, str(fake_claude), str(private_paseo),
-                                                   "--peppy-config-dir", str(peppy_profile))
+                                                   "--peppy-config-dir", str(peppy_profile),
+                                                   "--peppy-oauth-token-file", str(token_file))
             result = subprocess.run(install_command, env=env, stdin=subprocess.DEVNULL,
                                     capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             providers = runtime.read_json(paseo_home / "config.json")["agents"]["providers"]
-            self.assertEqual(providers["claude-peppy"]["env"], {"CLAUDE_CONFIG_DIR": str(resolved_peppy),
-                                                                "CLAUDE_CODEX_MODEL_LABEL_PREFIX": "Peppy"})
+            self.assertEqual(providers["claude-peppy"]["env"], {"CLAUDE_PEPPY_PASEO": "1"})
+            self.assertNotIn("sk-ant-oat01", (paseo_home / "config.json").read_text())
             paseo = str(base / "bin" / "paseo-codex")
             try:
                 self.run_paseo(paseo, env, "daemon", "restart", "--json", timeout=90)
@@ -294,27 +300,28 @@ class PaseoIntegrationTests(unittest.TestCase):
                                      "--wait-timeout", "90s", "--json", "Reply with OK.")
                 self.assertIn("OK", run.stdout)
                 agent_id = re.search(r'"agentId"\s*:\s*"([^"]+)"', run.stdout).group(1)
-                report = json.loads((peppy_profile / "spawn-report.json").read_text())
-                self.assertEqual(report["config"], str(resolved_peppy))
-                transcripts = list(peppy_profile.glob("projects/*/*.jsonl"))
-                self.assertEqual(len(transcripts), 1,
-                                 "the second account must record its transcript in its own profile")
-                self.assertFalse(list(daemon_profile.rglob("*.jsonl")),
-                                 "the second account must not write into the daemon's primary profile")
-                # A fresh daemon rebuilds the conversation from the peppy profile.
+                report = json.loads((daemon_profile / "spawn-report.json").read_text())
+                self.assertEqual(report["config"], str(daemon_profile))
+                self.assertEqual(report["token"], "sk-ant-oat01-integration-test")
+                self.assertEqual(report["marker"], "1")
+                self.assertEqual(len(list(daemon_profile.glob("projects/*/*.jsonl"))), 1,
+                                 "the second account's Paseo session must record its transcript where the daemon reads")
+                self.assertFalse(list(peppy_profile.rglob("*.jsonl")),
+                                 "Paseo sessions must not land in the terminal profile of the second account")
+                # A fresh daemon rebuilds the conversation without any patch.
                 self.run_paseo(paseo, env, "daemon", "restart", "--json", timeout=90)
                 snapshot = self.fetch_agent(client_module, env, agent_id, with_timeline=True)
                 timeline_text = json.dumps(snapshot["timeline"])
                 self.assertIn("Reply with OK.", timeline_text)
                 self.assertIn("OK", timeline_text)
                 self.assertNotEqual(snapshot["timeline"], [],
-                                    "replay after restart must come from the peppy profile")
+                                    "replay after restart must come from the daemon's profile")
             finally:
                 subprocess.run([paseo, "daemon", "stop", "--timeout", "10"], env=env,
                                capture_output=True, text=True, timeout=30)
 
     def run_paseo_session(self, effort, thinking=None, check_usage=False, check_live_usage=False,
-                          check_forked_skill=False, check_auto_mode=False):
+                          check_forked_skill=False, check_auto_mode=False, paseo_patch=False):
         with tempfile.TemporaryDirectory(prefix="claude-codex-paseo-") as temp:
             base = Path(temp)
             private_root = base / "private-paseo-cli"
@@ -322,7 +329,7 @@ class PaseoIntegrationTests(unittest.TestCase):
             client_module = private_root / "dist" / "utils" / "client.js"
             env, _, _, daemon_profile = self.isolated_daemon_environment(base)
             install_command = self.install_command(base, os.environ["CLAUDE_TEST_BINARY"],
-                                                   str(private_paseo))
+                                                   str(private_paseo), *(["--paseo-patch"] if paseo_patch else []))
             for attempt in range(2):
                 result = subprocess.run(install_command, env=env, stdin=subprocess.DEVNULL,
                                         capture_output=True, text=True, timeout=30)
@@ -376,7 +383,7 @@ class PaseoIntegrationTests(unittest.TestCase):
                     self.run_forked_skill_session(paseo, client_module, env, base, upstream)
                     return
                 if check_auto_mode:
-                    self.run_auto_mode_session(paseo, client_module, env, base, upstream)
+                    self.run_auto_mode_session(paseo, client_module, env, base, upstream, paseo_patch)
                     return
                 result = subprocess.run([
                     paseo, "run", "--provider", "claude-codex", "--model", runtime.model_id(effort),
@@ -507,27 +514,35 @@ class PaseoIntegrationTests(unittest.TestCase):
         restored = self.fetch_agent(client_module, env, agent_id, with_timeline=True)
         check(restored, "after restart")
 
-    def run_auto_mode_session(self, paseo, client_module, env, base, upstream):
+    def run_auto_mode_session(self, paseo, client_module, env, base, upstream, paseo_patch):
         project = base / "project"
         project.mkdir()
+        plugins = self.run_paseo(paseo, env, "plugin", "ls", "--json")
+        self.assertIn("claude-codex", plugins.stdout)
+        self.assertNotIn("failed", plugins.stdout)
         # Without a mode, the provider's default applies. The upstream only ever
         # answers with text, so a classifier request would be a Bash-free anomaly.
         result = self.run_paseo(paseo, env, "run", "--provider", "claude-codex", "--model", runtime.model_id("high"),
                                 "--cwd", str(project), "--wait-timeout", "60s", "--json", "Reply with OK.")
         default_agent = re.search(r'"agentId"\s*:\s*"([^"]+)"', result.stdout).group(1)
         snapshot = self.fetch_agent(client_module, env, default_agent)
-        self.assertEqual(snapshot["currentModeId"], "default", snapshot)
         self.assertEqual(snapshot["runtimeModeId"], "default", snapshot)
-        self.assertNotIn("auto", snapshot["availableModes"], snapshot)
         self.assertIn("bypassPermissions", snapshot["availableModes"], snapshot)
-        # An agent that still asks for auto mode, such as one created from an
-        # older profile, is run by Claude in its default prompting mode instead.
+        if paseo_patch:
+            # The legacy patch also removes auto mode from the advertised catalog.
+            self.assertEqual(snapshot["currentModeId"], "default", snapshot)
+            self.assertNotIn("auto", snapshot["availableModes"], snapshot)
+        # An agent that explicitly asks for auto mode, such as one created from
+        # an older profile, is created in the prompting mode by the plugin's
+        # hook, and Claude runs it that way.
         result = self.run_paseo(paseo, env, "run", "--provider", "claude-codex", "--model", runtime.model_id("high"),
                                 "--mode", "auto", "--cwd", str(project), "--wait-timeout", "60s", "--json", "Reply with OK.")
         auto_agent = re.search(r'"agentId"\s*:\s*"([^"]+)"', result.stdout).group(1)
         snapshot = self.fetch_agent(client_module, env, auto_agent)
+        self.assertEqual(snapshot["currentModeId"], "default", snapshot)
         self.assertEqual(snapshot["runtimeModeId"], "default", snapshot)
-        self.assertNotIn("auto", snapshot["availableModes"], snapshot)
+        if paseo_patch:
+            self.assertNotIn("auto", snapshot["availableModes"], snapshot)
         requests = []
         while not upstream.requests.empty():
             requests.append(upstream.requests.get_nowait()[1])

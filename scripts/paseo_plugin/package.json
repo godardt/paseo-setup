@@ -1,0 +1,11 @@
+{
+  "name": "claude-codex-paseo-plugin",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Paseo plugin installed by claude-codex: keeps Claude Codex agents out of the unavailable auto mode",
+  "devDependencies": {
+    "@getpaseo/plugin": ">=0.8.0",
+    "typescript": "^5.9.3"
+  }
+}

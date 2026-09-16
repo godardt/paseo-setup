@@ -1,4 +1,4 @@
-"""Offline coverage for the installer-managed Paseo usage compatibility patch.
+"""Offline coverage for the opt-in (legacy) Paseo compatibility patch and its removal.
 
 Only checked-in JavaScript and temporary package trees are read or executed.
 No installed Paseo package, daemon, upstream service, or credentials are needed.
@@ -146,6 +146,23 @@ class PatchSourceTests(unittest.TestCase):
                           prior.replace(PATCHED_INITIALIZER, INITIALIZER, 1)):
             with self.assertRaises(claude_codex.SetupError):
                 paseo_compat.patch_source(candidate)
+
+    def test_upstream_source_is_recovered_from_every_layout_and_unpatched_input(self):
+        self.assertEqual(paseo_compat.recover_upstream(self.source), self.source)
+        for index, edits in enumerate([self.edits, *paseo_compat.superseded_layouts()]):
+            with self.subTest(layout=index):
+                patched = self.source
+                for upstream, replacement in edits:
+                    patched = patched.replace(upstream, replacement, 1)
+                self.assertIn(paseo_compat.PATCH_MARKER, patched)
+                self.assertEqual(paseo_compat.recover_upstream(patched), self.source)
+        # A marker without a complete recognized layout is reported, never guessed.
+        current = paseo_compat.patch_source(self.source)
+        for candidate in (current.replace(PATCHED_INITIALIZER, INITIALIZER, 1),
+                          self.source + "\n" + paseo_compat.PATCH_MARKER + "\n",
+                          current.replace("this.codexLateUsage = launchEnv", "this.codexLateUsage = process.env", 1)):
+            with self.assertRaisesRegex(claude_codex.SetupError, "incomplete or modified"):
+                paseo_compat.recover_upstream(candidate)
 
     def test_prefixless_installer_layout_is_upgraded_to_the_current_patch(self):
         prefixless = self.source
@@ -862,6 +879,41 @@ class PatchFileTests(unittest.TestCase):
         sibling.parent.mkdir(parents=True)
         shutil.copyfile(TASK_SOURCE_FIXTURE, sibling)
         return target
+
+    def test_restore_removes_the_patch_with_a_backup_and_leaves_other_modules_alone(self):
+        self.assertFalse(paseo_compat.restore_upstream(self.binary, self.backup))
+        self.assertEqual(self.backups, [])
+        self.assertEqual(self.target.read_text(), self.source)
+        patched = paseo_compat.patch_source(self.source)
+        self.target.write_text(patched)
+        self.target.chmod(0o444)
+        backups = []
+
+        def backup(path):
+            self.assertEqual(path, self.target.resolve())
+            backups.append(path.read_text())
+        if NODE is None:
+            self.skipTest("Node.js is required to validate the restored module")
+        self.assertTrue(paseo_compat.restore_upstream(self.binary, backup))
+        self.assertEqual(backups, [patched])
+        self.assertEqual(self.target.read_text(), self.source)
+        self.assertEqual(self.target.stat().st_mode & 0o777, 0o444)
+        self.assertFalse(paseo_compat.restore_upstream(self.binary, backup))
+        self.assertEqual(backups, [patched])
+        # Unfamiliar upstream source without our marker is not ours to touch.
+        self.target.chmod(0o644)
+        self.target.write_text("export const unknownProviderLayout = true;\n")
+        self.assertFalse(paseo_compat.restore_upstream(self.binary, backup))
+        self.assertEqual(self.target.read_text(), "export const unknownProviderLayout = true;\n")
+        # A package this installer cannot inspect is skipped, not an error.
+        with patch.object(paseo_compat, "say") as say:
+            self.assertFalse(paseo_compat.restore_upstream(self.base / "missing-paseo", backup))
+        self.assertTrue(any("not inspected" in call.args[0] for call in say.call_args_list))
+        # A foreign marker is reported without any write.
+        self.target.write_text(self.source + "\n" + paseo_compat.PATCH_MARKER + "\n")
+        with self.assertRaisesRegex(claude_codex.SetupError, "incomplete or modified"):
+            paseo_compat.restore_upstream(self.binary, backup)
+        self.assertEqual(backups, [patched])
 
     def test_missing_or_unsupported_task_protocol_source_fails_without_changes(self):
         sibling = self.target.parent / "subagents" / "live-source.js"

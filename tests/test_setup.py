@@ -433,7 +433,9 @@ class InstallTests(unittest.TestCase):
 
     def test_paseo_merge_preserves_config_and_is_idempotent(self):
         config_file = self.base / "paseo.json"
-        original = {"version": 1, "daemon": {"port": 6768}, "agents": {
+        original = {"version": 1, "daemon": {"port": 6768}, "pluginsEnabled": False, "plugins": {
+            "mine": {"source": "directory", "path": "/plugins/mine", "enabled": False},
+        }, "agents": {
             "providers": {"claude": {"enabled": True}, "other": {"extends": "codex", "label": "Other"}}
         }}
         runtime.write_json(config_file, original)
@@ -441,6 +443,13 @@ class InstallTests(unittest.TestCase):
         install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
         actual = runtime.read_json(config_file)
         self.assertEqual(actual["daemon"], original["daemon"])
+        # The plugin is registered from the data directory; other plugins and
+        # settings are preserved, and the global switch is turned on.
+        self.assertIs(actual["pluginsEnabled"], True)
+        self.assertEqual(actual["plugins"], {
+            "mine": original["plugins"]["mine"],
+            "claude-codex": {"source": "directory", "path": str(self.base / "data" / "paseo-plugin"), "enabled": True},
+        })
         self.assertEqual(actual["agents"]["providers"]["claude"], {"enabled": True})
         self.assertEqual(actual["agents"]["providers"]["other"], original["agents"]["providers"]["other"])
         provider = actual["agents"]["providers"]["claude-codex"]
@@ -459,14 +468,29 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(peppy["extends"], "claude")
         self.assertEqual(peppy["label"], "Claude Peppy")
         self.assertEqual(peppy["command"], [str(self.base / "bin" / "claude-peppy")])
-        self.assertEqual(peppy["env"], {"CLAUDE_CONFIG_DIR": str(self.base / "claude-peppy"),
-                                        "CLAUDE_CODEX_MODEL_LABEL_PREFIX": "Peppy"})
+        # No profile pin and no token: the launcher runs Paseo sessions in the
+        # daemon's profile and reads the token from the private settings.
+        self.assertEqual(peppy["env"], {"CLAUDE_PEPPY_PASEO": "1"})
         self.assertNotIn("models", peppy)
         self.assertNotIn("test-local-key", config_file.read_text())
+        self.settings["peppy_oauth_token"] = "sk-ant-oat01-secret"
+        self.assertNotIn("secret", config_file.read_text())
         first = config_file.read_bytes()
         install.merge_paseo(config_file, self.settings, {"paseo_config": str(config_file)}, include_peppy=True)
         self.assertEqual(config_file.read_bytes(), first)
         self.assertEqual(len(list(self.base.glob("paseo.json.claude-codex-backup-*"))), 1)
+        # A plugin the user disabled stays disabled across reruns.
+        disabled = runtime.read_json(config_file)
+        disabled["plugins"]["claude-codex"]["enabled"] = False
+        runtime.write_json(config_file, disabled)
+        install.merge_paseo(config_file, self.settings, {"paseo_config": str(config_file)}, include_peppy=True)
+        self.assertIs(runtime.read_json(config_file)["plugins"]["claude-codex"]["enabled"], False)
+        # A plugin entry left by an installation in another data directory is ours to move.
+        moved = {**self.settings, "data_dir": str(self.base / "moved-data")}
+        install.merge_paseo(config_file, moved, {"paseo_config": str(config_file),
+                                                 "data_dir": self.settings["data_dir"]}, include_peppy=True)
+        self.assertEqual(runtime.read_json(config_file)["plugins"]["claude-codex"]["path"],
+                         str(self.base / "moved-data" / "paseo-plugin"))
 
     def test_paseo_merge_without_peppy_leaves_existing_entry_untouched(self):
         config_file = self.base / "paseo.json"
@@ -490,6 +514,17 @@ class InstallTests(unittest.TestCase):
                 with self.assertRaises(runtime.SetupError) as caught:
                     install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
                 self.assertIn(expected, str(caught.exception))
+        config_file = self.base / "paseo-plugin-conflict.json"
+        foreign = {"version": 1, "plugins": {"claude-codex": {"source": "directory", "path": "/elsewhere"}}}
+        runtime.write_json(config_file, foreign)
+        for previous in ({}, {"paseo_config": str(config_file), "data_dir": self.settings["data_dir"]}):
+            with self.subTest(previous=previous):
+                with self.assertRaisesRegex(runtime.SetupError, "unrelated plugin named claude-codex"):
+                    install.merge_paseo(config_file, self.settings, previous, include_peppy=False)
+                self.assertEqual(runtime.read_json(config_file), foreign)
+        runtime.write_json(config_file, {"version": 1, "plugins": []})
+        with self.assertRaisesRegex(runtime.SetupError, "plugins must be an object"):
+            install.merge_paseo(config_file, self.settings, {}, include_peppy=False)
 
     def test_invalid_paseo_config_not_overwritten(self):
         for content in ('{"agents":[]}', '{"agents":{"providers":[]}}', '{bad', '[]'):
@@ -562,13 +597,18 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(peppy_launcher.read_text().splitlines()[1], install.MARKER)
         peppy_provider_entry = runtime.read_json(self.base / "paseo" / "config.json")["agents"]["providers"]["claude-peppy"]
         self.assertEqual(peppy_provider_entry["command"], [str(peppy_launcher)])
-        self.assertEqual(peppy_provider_entry["env"], {"CLAUDE_CONFIG_DIR": str(self.base / "claude-peppy"),
-                                                       "CLAUDE_CODEX_MODEL_LABEL_PREFIX": "Peppy"})
-        patched_reader = reader.read_text()
-        self.assertEqual(patched_reader, paseo_compat.patch_source(original_reader))
-        backups = list(reader.parent.glob("agent.js.claude-codex-backup-*"))
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(backups[0].read_text(), original_reader)
+        self.assertEqual(peppy_provider_entry["env"], {"CLAUDE_PEPPY_PASEO": "1"})
+        # Paseo's own module is left exactly as shipped; the plugin is installed instead.
+        self.assertEqual(reader.read_text(), original_reader)
+        self.assertFalse(list(reader.parent.glob("agent.js.claude-codex-backup-*")))
+        paseo_settings = runtime.read_json(self.base / "paseo" / "config.json")
+        plugin_dir = Path(self.settings["data_dir"]) / "paseo-plugin"
+        self.assertIs(paseo_settings["pluginsEnabled"], True)
+        self.assertEqual(paseo_settings["plugins"],
+                         {"claude-codex": {"source": "directory", "path": str(plugin_dir), "enabled": True}})
+        for name in install.PLUGIN_FILES:
+            self.assertEqual((plugin_dir / name).read_text(), (ROOT / "scripts" / "paseo_plugin" / name).read_text())
+        (plugin_dir / "stale.server.ts").write_text("// from an earlier version\n")
         installed_runtime = Path(self.settings["data_dir"]) / "claude_codex.py"
         installed_runtime.write_text("# outdated installed launcher\n")
         auth = Path(self.settings["config_dir"]) / "auth" / "preserved.json"
@@ -579,17 +619,24 @@ class InstallTests(unittest.TestCase):
         runtime.write_json(paseo_config, providers)
         subprocess.run(args, check=True, capture_output=True, text=True)
         self.assertEqual(first, runtime.read_json(config_file))
-        self.assertEqual(reader.read_text(), patched_reader)
-        self.assertEqual(list(reader.parent.glob("agent.js.claude-codex-backup-*")), backups)
+        self.assertEqual(reader.read_text(), original_reader)
+        self.assertFalse(list(reader.parent.glob("agent.js.claude-codex-backup-*")))
+        self.assertFalse((plugin_dir / "stale.server.ts").exists())
         self.assertEqual(installed_runtime.read_bytes(), (ROOT / "scripts" / "claude_codex.py").read_bytes())
         self.assertEqual(runtime.read_json(auth)["refresh_token"], "dummy-preserve-only")
         self.assertEqual(runtime.read_json(paseo_config), providers)
-        # A user-managed Paseo reinstall replaces its files; reapplying this
-        # installer must repair that fresh reader, not trust a settings marker.
-        reader.write_text(original_reader)
+        # The legacy source patch is opt-in, and a default run removes it again
+        # from its recovered upstream source, keeping a backup each time.
+        subprocess.run([*args, "--paseo-patch"], check=True, capture_output=True, text=True)
+        patched_reader = reader.read_text()
+        self.assertEqual(patched_reader, paseo_compat.patch_source(original_reader))
+        backups = sorted(reader.parent.glob("agent.js.claude-codex-backup-*"))
+        self.assertEqual([backup.read_text() for backup in backups], [original_reader])
         subprocess.run(args, check=True, capture_output=True, text=True)
-        self.assertEqual(reader.read_text(), patched_reader)
-        self.assertEqual(len(list(reader.parent.glob("agent.js.claude-codex-backup-*"))), 2)
+        self.assertEqual(reader.read_text(), original_reader)
+        backups = sorted(reader.parent.glob("agent.js.claude-codex-backup-*"))
+        self.assertEqual([backup.read_text() for backup in backups], [original_reader, patched_reader])
+        self.assertEqual(runtime.read_json(paseo_config), providers)
         self.assertEqual(claude.read_bytes(), claude_before)
         self.assertEqual(config_file.stat().st_mode & 0o777, 0o600)
         self.assertEqual(Path(self.settings["config_dir"]).stat().st_mode & 0o777, 0o700)
@@ -623,13 +670,18 @@ class InstallTests(unittest.TestCase):
              patch.object(install, "atomic_write") as write, \
              patch.object(install, "write_json") as write_json:
             with self.assertRaisesRegex(runtime.SetupError, "Unsupported Paseo"):
-                install.install(install.parser().parse_args(args))
+                install.install(install.parser().parse_args([*args, "--paseo-patch"]))
         stop.assert_not_called()
         write.assert_not_called()
         write_json.assert_not_called()
         self.assertEqual(reader.read_bytes(), original)
         self.assertFalse(list(reader.parent.glob("agent.js.claude-codex-backup-*")))
         self.assertFalse((self.base / "paseo-home" / "config.json").exists())
+        # Without the opt-in patch, Paseo's module is never a compatibility concern.
+        install.install(install.parser().parse_args(args))
+        self.assertEqual(reader.read_bytes(), original)
+        self.assertFalse(list(reader.parent.glob("agent.js.claude-codex-backup-*")))
+        self.assertIn("claude-codex", runtime.read_json(self.base / "paseo-home" / "config.json")["plugins"])
 
     def test_absent_paseo_is_skipped_without_npm_or_config_changes(self):
         claude = self.fake_cli("claude-original", "print('Claude Code')\n")
@@ -663,9 +715,10 @@ class InstallTests(unittest.TestCase):
         install.install(install.parser().parse_args(args + ["--paseo-bin", str(private_paseo), "--skip-paseo-start"]))
         test_path = str(self.base) + os.pathsep + os.environ.get("PATH", "")
         def check_activation(command, **kwargs):
-            self.assertIn(paseo_compat.PATCH_MARKER, paseo_compat.find_usage_reader(system_paseo).read_text())
+            self.assertNotIn(paseo_compat.PATCH_MARKER, paseo_compat.find_usage_reader(system_paseo).read_text())
+            self.assertTrue((Path(self.settings["data_dir"]) / "paseo-plugin" / "index.server.ts").is_file())
             return subprocess.CompletedProcess(command, 0)
-        with patch.dict(os.environ, {"PATH": test_path}), patch.object(paseo_compat, "check_syntax"), \
+        with patch.dict(os.environ, {"PATH": test_path}), \
              patch.object(install.subprocess, "run", side_effect=check_activation) as run:
             install.install(install.parser().parse_args(args))
         self.assertEqual([call.args[0] for call in run.call_args_list],
@@ -936,6 +989,163 @@ class InstallTests(unittest.TestCase):
             install.install(opts)
         self.assertEqual([call.args[0] for call in spawn.call_args_list],
                          [[str(paseo), "daemon", "restart"], [str(paseo), "reload"]])
+
+    def test_legacy_patch_is_removed_by_default_and_applied_on_request(self):
+        paseo = self.fake_paseo("paseo", "print('paseo')\n")
+        reader = paseo_compat.find_usage_reader(paseo)
+        original = reader.read_text()
+        args = self.staged_args("--paseo-bin", str(paseo))
+
+        def applied(edits):
+            source = original
+            for upstream, patched in edits:
+                source = source.replace(upstream, patched, 1)
+            return source
+
+        layouts = [paseo_compat.replacements(), *paseo_compat.superseded_layouts()]
+        for index, edits in enumerate(layouts):
+            with self.subTest(layout=index):
+                reader.write_text(applied(edits))
+                install.install(install.parser().parse_args(args))
+                self.assertEqual(reader.read_text(), original)
+                backups = sorted(reader.parent.glob("agent.js.claude-codex-backup-*"))
+                self.assertEqual(len(backups), index + 1)
+                self.assertEqual(backups[-1].read_text(), applied(edits))
+        # A marker without a recognized layout is never guessed at; nothing is written.
+        foreign = original + "\n" + paseo_compat.PATCH_MARKER + " (locally edited)\n"
+        reader.write_text(foreign)
+        paseo_config = self.base / "paseo-home" / "config.json"
+        before = paseo_config.read_bytes()
+        with patch.object(install.Runtime, "stop") as stop:
+            with self.assertRaisesRegex(runtime.SetupError, "incomplete or modified"):
+                install.install(install.parser().parse_args(args))
+        stop.assert_not_called()
+        self.assertEqual(reader.read_text(), foreign)
+        self.assertEqual(paseo_config.read_bytes(), before)
+        self.assertEqual(len(list(reader.parent.glob("agent.js.claude-codex-backup-*"))), len(layouts))
+        reader.write_text(original)
+        install.install(install.parser().parse_args([*args, "--paseo-patch"]))
+        self.assertEqual(reader.read_text(), paseo_compat.patch_source(original))
+
+    def test_peppy_token_precedence_validation_and_prompt(self):
+        opts = install.parser().parse_args(self.staged_args("--skip-paseo"))
+        token_file = self.base / "peppy-token.txt"
+        token_file.write_text("sk-ant-oat01-from-file\n")
+        opts.peppy_oauth_token_file = str(token_file)
+        saved = {"peppy_oauth_token": "sk-ant-oat01-saved"}
+        self.assertEqual(install.prepare_peppy_token(opts, saved, "sk-ant-oat01-from-env"), "sk-ant-oat01-from-file")
+        opts.peppy_oauth_token_file = None
+        self.assertEqual(install.prepare_peppy_token(opts, saved, "sk-ant-oat01-from-env"), "sk-ant-oat01-from-env")
+        self.assertEqual(install.prepare_peppy_token(opts, saved, None), "sk-ant-oat01-saved")
+        for bad in ("", "   \n", "two words", "tab\tinside"):
+            with self.subTest(value=bad):
+                with self.assertRaisesRegex(runtime.SetupError, "single line"):
+                    install.prepare_peppy_token(opts, {}, bad)
+        token_file.write_text("with space inside\n")
+        opts.peppy_oauth_token_file = str(token_file)
+        with self.assertRaisesRegex(runtime.SetupError, "single line"):
+            install.prepare_peppy_token(opts, {}, None)
+        opts.peppy_oauth_token_file = str(self.base / "missing-token-file")
+        with self.assertRaisesRegex(runtime.SetupError, "Cannot read --peppy-oauth-token-file"):
+            install.prepare_peppy_token(opts, {}, None)
+        opts.peppy_oauth_token_file = None
+        # Staged and noninteractive runs never prompt; interactive runs prompt masked.
+        with patch.object(install.sys.stdin, "isatty", return_value=True), \
+             patch.object(install, "masked_input", return_value="sk-ant-oat01-typed") as prompt:
+            self.assertIsNone(install.prepare_peppy_token(opts, {}, None))
+            prompt.assert_not_called()
+            opts.skip_login = False
+            with patch.object(install, "say") as say:
+                self.assertEqual(install.prepare_peppy_token(opts, {}, None), "sk-ant-oat01-typed")
+            prompt.assert_called_once_with(
+                "Second account token from claude setup-token (masked with *; Enter to skip): ")
+            self.assertTrue(any("claude-peppy setup-token" in call.args[0] for call in say.call_args_list))
+            self.assertFalse(any("sk-ant-oat01-typed" in call.args[0] for call in say.call_args_list))
+            prompt.return_value = ""
+            self.assertIsNone(install.prepare_peppy_token(opts, {}, None))
+            prompt.side_effect = OSError("sensitive terminal details")
+            with self.assertRaisesRegex(runtime.SetupError, "masked token") as raised:
+                install.prepare_peppy_token(opts, {}, None)
+            self.assertNotIn("sensitive", str(raised.exception))
+        with patch.object(install.sys.stdin, "isatty", return_value=False), \
+             patch.object(install, "masked_input") as prompt:
+            self.assertIsNone(install.prepare_peppy_token(opts, {}, None))
+            prompt.assert_not_called()
+
+    def test_peppy_token_is_saved_privately_retained_and_kept_from_paseo(self):
+        paseo = self.fake_paseo("paseo", "print('paseo')\n")
+        args = self.staged_args("--paseo-bin", str(paseo))
+        settings_file = Path(self.settings["config_dir"]) / "settings.json"
+        paseo_config = self.base / "paseo-home" / "config.json"
+        with patch.dict(os.environ, {"CLAUDE_PEPPY_OAUTH_TOKEN": "sk-ant-oat01-env-token"}):
+            install.install(install.parser().parse_args(args))
+            self.assertNotIn("CLAUDE_PEPPY_OAUTH_TOKEN", os.environ)
+        self.assertEqual(runtime.read_json(settings_file)["peppy_oauth_token"], "sk-ant-oat01-env-token")
+        self.assertEqual(settings_file.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn("sk-ant-oat01", paseo_config.read_text())
+        self.assertEqual(runtime.read_json(paseo_config)["agents"]["providers"]["claude-peppy"]["env"],
+                         {"CLAUDE_PEPPY_PASEO": "1"})
+        # Reruns keep the saved token; a file replaces it; --skip-peppy retains it.
+        install.install(install.parser().parse_args(args))
+        self.assertEqual(runtime.read_json(settings_file)["peppy_oauth_token"], "sk-ant-oat01-env-token")
+        token_file = self.base / "rotated.txt"
+        token_file.write_text("sk-ant-oat01-rotated")
+        install.install(install.parser().parse_args([*args, "--peppy-oauth-token-file", str(token_file)]))
+        self.assertEqual(runtime.read_json(settings_file)["peppy_oauth_token"], "sk-ant-oat01-rotated")
+        skip_args = [*args, "--skip-peppy"]
+        del skip_args[skip_args.index("--peppy-config-dir"):skip_args.index("--peppy-config-dir") + 2]
+        install.install(install.parser().parse_args(skip_args))
+        self.assertEqual(runtime.read_json(settings_file)["peppy_oauth_token"], "sk-ant-oat01-rotated")
+        # The daemon is restarted without the input token in its environment.
+        opts = install.parser().parse_args(args)
+        opts.skip_paseo_start = False
+
+        def run(command, **kwargs):
+            self.assertNotIn("CLAUDE_PEPPY_OAUTH_TOKEN", os.environ)
+            self.assertNotIn("CLAUDE_PEPPY_OAUTH_TOKEN", kwargs.get("env", {}))
+            return subprocess.CompletedProcess(command, 0)
+        with patch.dict(os.environ, {"CLAUDE_PEPPY_OAUTH_TOKEN": "sk-ant-oat01-not-for-daemon"}), \
+             patch.object(install.subprocess, "run", side_effect=run) as spawn:
+            install.install(opts)
+        self.assertEqual([call.args[0] for call in spawn.call_args_list],
+                         [[str(paseo), "daemon", "restart"], [str(paseo), "reload"]])
+
+    def test_peppy_launcher_under_paseo_uses_daemon_profile_and_saved_token(self):
+        claude = self.fake_cli("claude-reporting", "import json,os,sys\n"
+                               "print(json.dumps({'args':sys.argv[1:],'config':os.environ.get('CLAUDE_CONFIG_DIR'),"
+                               "'token':os.environ.get('CLAUDE_CODE_OAUTH_TOKEN'),'marker':os.environ.get('CLAUDE_PEPPY_PASEO')}))\n")
+        token_file = self.base / "token.txt"
+        token_file.write_text("sk-ant-oat01-paseo\n")
+        install.install(install.parser().parse_args(self.staged_args(
+            "--skip-paseo", "--claude-bin", str(claude), "--peppy-oauth-token-file", str(token_file))))
+        wrapper = Path(self.settings["bin_dir"]) / "claude-peppy"
+        # The test shell may itself run inside a Claude profile; start from a clean one.
+        ambient = {name: value for name, value in os.environ.items() if name != "CLAUDE_CONFIG_DIR"}
+        ambient.update({"CLAUDE_CODE_OAUTH_TOKEN": "ambient-token", "ANTHROPIC_API_KEY": "ambient-key"})
+        # A provider entry from an older installer still pins the peppy profile;
+        # Paseo launches drop it and select the account by the saved token.
+        for pinned in (None, str(self.base / "claude-peppy")):
+            with self.subTest(pinned=pinned):
+                env = {**ambient, "CLAUDE_PEPPY_PASEO": "1", **({"CLAUDE_CONFIG_DIR": pinned} if pinned else {})}
+                result = subprocess.run([str(wrapper), "-p", "hi"], check=True, capture_output=True, text=True, env=env)
+                self.assertEqual(json.loads(result.stdout),
+                                 {"args": ["-p", "hi"], "config": None, "token": "sk-ant-oat01-paseo", "marker": "1"})
+        daemon = subprocess.run([str(wrapper), "--version"], check=True, capture_output=True, text=True,
+                                env={**ambient, "CLAUDE_PEPPY_PASEO": "1", "CLAUDE_CONFIG_DIR": "/daemon/claude"})
+        self.assertEqual(json.loads(daemon.stdout)["config"], "/daemon/claude")
+        terminal = subprocess.run([str(wrapper), "--version"], check=True, capture_output=True, text=True, env=ambient)
+        self.assertEqual(json.loads(terminal.stdout), {"args": ["--version"], "config": str(self.base / "claude-peppy"),
+                                                       "token": None, "marker": None})
+        # Without a saved token a Paseo launch fails instead of using the daemon's own login.
+        settings_file = Path(self.settings["config_dir"]) / "settings.json"
+        saved = runtime.read_json(settings_file)
+        del saved["peppy_oauth_token"]
+        runtime.write_json(settings_file, saved)
+        failed = subprocess.run([str(wrapper), "-p", "hi"], capture_output=True, text=True,
+                                env={**ambient, "CLAUDE_PEPPY_PASEO": "1"})
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("claude-peppy setup-token", failed.stderr)
+        self.assertEqual(failed.stdout, "")
 
     def test_launcher_refuses_to_replace_unrelated_program(self):
         target = self.base / "claude-codex"

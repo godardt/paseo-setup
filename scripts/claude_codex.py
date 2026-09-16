@@ -55,6 +55,9 @@ CLAUDE_OPTIONAL_VALUE_OPTIONS = {
 # permission prompts instead. Set CLAUDE_CODEX_AUTO_MODE=1 to keep auto mode.
 LAUNCHER_SETTINGS = {"permissions": {"disableAutoMode": "disable"}}
 AUTO_MODE_OVERRIDE = "CLAUDE_CODEX_AUTO_MODE"
+# Set by the generated Paseo provider entries; never by terminal launches.
+PASEO_MARKER = "CLAUDE_CODEX_PASEO_USAGE"
+PEPPY_PASEO_MARKER = "CLAUDE_PEPPY_PASEO"
 
 # Ambient variables from the surrounding shell or daemon that would reroute a
 # Claude session or leak another provider's configuration into it.
@@ -348,8 +351,11 @@ def isolated_profile(settings):
 
 
 def paseo_mode(env):
-    # Set by the generated Paseo provider entry; never by terminal launches.
-    return env.get("CLAUDE_CODEX_PASEO_USAGE") == "1"
+    return env.get(PASEO_MARKER) == "1"
+
+
+def peppy_paseo_mode(env):
+    return env.get(PEPPY_PASEO_MARKER) == "1"
 
 
 def daemon_profile(env):
@@ -406,16 +412,33 @@ def claude_env(settings, effort, source=None):
 
 
 def peppy_env(settings, source=None):
-    """Environment for the second account: its own profile, Anthropic endpoints.
+    """Environment for the second account: Anthropic endpoints, its own login.
 
     The scrubbed routing variables cannot silently redirect the account to
-    another gateway or model selection; its login, settings, and any gateway
-    configuration belong to the profile directory itself.
+    another gateway or model selection. Terminal launches run in the account's
+    own profile directory, which holds its login, settings, and history.
+
+    Paseo launches instead run in the profile Paseo's daemon reads transcripts
+    from, so conversations replay after daemon restarts without any change to
+    Paseo itself; the account is selected by its long-lived token from
+    `claude setup-token`, which Claude Code ranks above the profile's login.
     """
     env = dict(os.environ if source is None else source)
     for name in PEPPY_SCRUB_ENV:
         env.pop(name, None)
-    env["CLAUDE_CONFIG_DIR"] = settings["peppy_config_dir"]
+    if peppy_paseo_mode(env):
+        token = settings.get("peppy_oauth_token")
+        if not token:
+            raise SetupError("No long-lived token is saved for the second account's Paseo sessions. "
+                             "Run claude-peppy setup-token, then rerun ./install.sh and paste the token "
+                             "(or pass --peppy-oauth-token-file)")
+        # Provider entries written by older installers pinned the profile.
+        pinned = env.get("CLAUDE_CONFIG_DIR")
+        if pinned is not None and pinned in (settings.get("peppy_config_dir"), isolated_profile(settings)):
+            del env["CLAUDE_CONFIG_DIR"]
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    else:
+        env["CLAUDE_CONFIG_DIR"] = settings["peppy_config_dir"]
     prepend_node_dir(env, settings)
     return env
 
@@ -665,17 +688,18 @@ def resumed_session(args):
     return None
 
 
-def adopt_isolated_transcript(settings, args, env):
+def adopt_isolated_transcript(settings, args, env, profile=None):
     """Move a resumed session recorded by an older launcher into Paseo's profile.
 
     Before Paseo launches used the daemon's profile, transcripts went to the
-    isolated profile. Moving the exact session Paseo resumes lets Claude find
-    the conversation and lets Paseo display it after its next reload.
+    isolated profile (or, for the second account, its own profile). Moving the
+    exact session Paseo resumes lets Claude find the conversation and lets
+    Paseo display it after its next reload.
     """
     session_id = resumed_session(args)
     if not session_id:
         return
-    source = Path(isolated_profile(settings)) / "projects"
+    source = Path(profile or isolated_profile(settings)) / "projects"
     target = daemon_profile(env) / "projects"
     if not source.is_dir() or (target.exists() and target.samefile(source)):
         return
@@ -734,9 +758,24 @@ def run_paseo_stream(binary, args, env):
             signal.signal(signum, previous)
 
 
+# Claude Code's management subcommands (`claude <command> ...`). They accept
+# none of the session options the launchers add, so their arguments are
+# forwarded untouched; a bare first word outside this list is a prompt.
+CLAUDE_COMMANDS = frozenset((
+    "agents", "attach", "auth", "auto-mode", "doctor", "gateway", "import", "install", "logs", "mcp",
+    "plugin", "plugins", "project", "respawn", "rm", "setup-token", "stop", "kill", "ultrareview",
+    "update", "upgrade",
+))
+
+
+def management_command(args):
+    return bool(args) and args[0] in CLAUDE_COMMANDS
+
+
 def probe_args(args):
-    # Availability probes must succeed without login, proxy startup, or extra config.
-    return args in (["--version"], ["-v"], ["--help"], ["-h"]) or args[:2] == ["auth", "status"]
+    # Availability probes and management commands run without login, proxy
+    # startup, or extra session configuration.
+    return args in (["--version"], ["-v"], ["--help"], ["-h"]) or management_command(args)
 
 
 def launch(settings, args):
@@ -783,7 +822,13 @@ def launch_peppy(settings, args):
     if not probe_args(args):
         args = apply_plane_mcp(args, settings, prepend=False)
     binary = settings["claude_bin"]
-    os.execve(binary, [binary, *args], peppy_env(settings))
+    env = peppy_env(settings)
+    if peppy_paseo_mode(env) and not probe_args(args):
+        try:
+            adopt_isolated_transcript(settings, args, env, settings["peppy_config_dir"])
+        except OSError as exc:
+            say(f"claude-peppy: could not move the earlier transcript into Paseo's Claude profile: {exc}")
+    os.execve(binary, [binary, *args], env)
 
 
 def control(settings, args):
