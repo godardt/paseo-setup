@@ -49,7 +49,7 @@ Model access and usage limits come from the signed-in ChatGPT account, not a pro
 3. Downloads **CLIProxyAPI 7.2.155** and verifies a pinned SHA-256 checksum. Linux uses the static build without plugin support.
 4. Creates an isolated configuration, OAuth directory, random local API token, and Claude profile with private file permissions.
 5. Installs `claude-codex`, `claude-codex-proxy`, `claude-peppy`, and (when Paseo is detected) `paseo-codex` into `~/.local/bin`, then adds that directory to your shell's startup configuration.
-6. When Paseo is detected, copies the Paseo plugin into the data directory, then backs up and merges into `$PASEO_HOME/config.json` (default `~/.paseo/config.json`): the two provider entries, the plugin entry under `plugins`, and `pluginsEnabled: true`. Other providers, plugins, and settings are preserved. Paseo's own files are not touched; if its Claude provider module still carries the source patch of an earlier version of this installer, that is reported with instructions to reinstall Paseo (see "Earlier versions" below).
+6. When Paseo is detected, copies the Paseo plugin into the data directory, then backs up and merges into `$PASEO_HOME/config.json` (default `~/.paseo/config.json`): the two provider entries, the plugin entry under `plugins`, and `pluginsEnabled: true`. Other providers, plugins, and settings are preserved. It also opens the daemon to other devices (see "Daemon network access" below). Paseo's own files are not touched; if its Claude provider module still carries the source patch of an earlier version of this installer, that is reported with instructions to reinstall Paseo (see "Earlier versions" below).
 7. Offers a masked Plane token prompt, or reuses a saved/supplied token, and installs a private GET-only MCP connector for the `peppy` workspace. No additional packages are needed. Missing credentials in noninteractive/staged installs skip new Plane setup without blocking; existing connections are retained. Likewise offers a masked prompt for the second account's long-lived token (see "The second account in Paseo").
 8. Runs CLIProxyAPI's own ChatGPT OAuth login if needed, starts the local proxy, and sends a small Anthropic Messages request to Astra.
 9. When Paseo is detected, restarts the local Paseo daemon using that existing executable and reloads its configuration. Finish active Paseo sessions first, or pass `--skip-paseo-start` to activate it later.
@@ -148,6 +148,12 @@ Consequences of running in the daemon's profile: Paseo sessions of the second ac
 
 ## Use with Paseo
 
+### Daemon network access
+
+A fresh Paseo daemon listens on `127.0.0.1:6767`, reachable only from the same machine. The installer switches a loopback listener to **all interfaces** (`daemon.listen` = `0.0.0.0:<same port>`) so phones and other computers can connect directly to this machine's address, as Paseo documents for LAN access. No daemon password is set or required by the installer, so the daemon accepts connections from anyone who can reach that port; this is intended for trusted networks. Paseo's own `paseo-codex daemon set-password` adds a password if you want one (Paseo stores a bcrypt hash and honours `PASEO_PASSWORD` at daemon start), and the installer leaves any configured password untouched. Paseo's host allowlist accepts IP addresses by default; to connect by a DNS name, add it to `daemon.hostnames` in `config.json`.
+
+`--paseo-listen HOST[:PORT]` chooses another address (the port is kept unless given), and `--paseo-listen keep` leaves the listener alone. A listener that is a Unix socket or already a specific non-loopback address (a Tailscale IP, for example) is never changed. The daemon restart at the end of the run applies the new address; with `--skip-paseo-start`, run `paseo-codex daemon restart` yourself.
+
 After installation, select the **Claude Codex · GPT-6 Astra** provider when creating an agent. The **model picker** lists the five Astra reasoning levels plus **GPT-6 Astra · Ultra Code**. The provider uses `extends: "claude"` and the absolute path to `claude-codex`, so the daemon does not depend on your interactive shell's PATH.
 
 ### Permission modes in Paseo
@@ -231,6 +237,8 @@ bash install.sh --skip-login --skip-paseo-start --no-path
 
 bash install.sh --help
 ```
+
+`--paseo-listen` controls the daemon's listen address (see "Daemon network access"). The installer prints a heading for each stage (Paseo, Plane, installation, the Claude Codex sign-in, the second account, the Paseo daemon, done), with results in green and skipped or missing pieces in yellow. Colors are used only on a terminal; set `NO_COLOR=1` to turn them off.
 
 `--skip-codex-login` skips the ChatGPT sign-in and its live verification while still installing everything else, the same as answering `skip` at the prompt; an existing ChatGPT login is verified without asking. `--skip-smoke-test` skips the subscription-consuming verification request. `--skip-paseo-start` stages the provider and plugin configuration but leaves daemon activation to you; subsequently run `paseo-codex daemon restart` and `paseo-codex reload`.
 

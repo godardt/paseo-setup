@@ -22,13 +22,36 @@ import tarfile
 import tempfile
 import termios
 import time
-import tty
 
 import plane_mcp
 from claude_codex import (
     CONTEXT_WINDOW, EFFORTS, REASONING_MODES, ULTRACODE_MODEL, MARKER, MODEL, PASEO_MARKER, PEPPY_PASEO_MARKER,
-    Runtime, SetupError, atomic_write, model_id, file_lock, peppy_env, proxy_config, read_json, say, write_json,
+    Runtime, SetupError, atomic_write, model_id, file_lock, peppy_env, proxy_config, read_json, write_json,
 )
+from claude_codex import say as emit
+
+# Output tones, applied only on a color terminal (see paint).
+TONES = {"step": "\x1b[1;36m", "ok": "\x1b[32m", "warn": "\x1b[33m", "prompt": "\x1b[1m"}
+
+
+def color_enabled():
+    return sys.stderr.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+
+def paint(text, tone):
+    if tone is None or not color_enabled():
+        return text
+    return f"{TONES[tone]}{text}\x1b[0m"
+
+
+def say(message, tone=None):
+    emit(paint(message, tone))
+
+
+def step(title):
+    """Announce the installer stage the following messages and prompts belong to."""
+    emit("")
+    say(f"▸ {title}", "step")
 
 PROXY_VERSION = "7.2.155"
 # The Paseo plugin shipped in this repository; installed as a directory plugin
@@ -278,7 +301,7 @@ def install_paseo(command):
     if not found:
         raise SetupError("Paseo was installed but no paseo executable was found on PATH; open a new terminal and "
                          "rerun ./install.sh, or pass --paseo-bin")
-    say(f"Installed Paseo: {found}")
+    say(f"Installed Paseo: {found}", "ok")
     return str(Path(found).absolute())
 
 
@@ -414,6 +437,68 @@ def merge_paseo(path, settings, previous, include_peppy):
     write_json(path, config)
 
 
+LOOPBACK_HOSTS = {"", "127.0.0.1", "localhost", "::1"}
+DEFAULT_PASEO_PORT = "6767"
+
+
+def paseo_listen(config):
+    return (config.get("daemon") or {}).get("listen") or f"127.0.0.1:{DEFAULT_PASEO_PORT}"
+
+
+def split_listen(listen):
+    """(host, port) of a TCP listen string, or None for a socket or pipe."""
+    if listen.startswith(("/", "~", "unix://", "pipe://", "\\\\.\\pipe\\")):
+        return None
+    if listen.endswith("]"):  # [::] without a port
+        return listen.strip("[]"), DEFAULT_PASEO_PORT
+    host, separator, port = listen.rpartition(":")
+    if not separator:
+        return ("", listen) if listen.isdigit() else (listen, DEFAULT_PASEO_PORT)
+    return host.strip("[]"), port
+
+
+def paseo_listen_update(config, requested):
+    """The daemon.listen value to write, or None when it should stay as it is.
+
+    Only a loopback TCP listener is changed: a socket, or an address the user
+    chose deliberately (a Tailscale IP, for example), is kept.
+    """
+    if requested == "keep":
+        return None
+    current = split_listen(paseo_listen(config))
+    if current is None or current[0] not in LOOPBACK_HOSTS:
+        return None
+    wanted = split_listen(requested)
+    if wanted is None or not wanted[1].isdigit():
+        raise SetupError("--paseo-listen must be HOST, HOST:PORT, or keep")
+    host = wanted[0] or "0.0.0.0"
+    explicit_port = requested.isdigit() or (":" in requested and not requested.endswith("]"))
+    port = wanted[1] if explicit_port else current[1]
+    if host in LOOPBACK_HOSTS and port == current[1]:
+        return None
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def configure_paseo_network(paseo_config, opts):
+    """Make the daemon reachable from other devices on the network.
+
+    Paseo validates the Host header (IP addresses always pass) and, by this
+    installer's default, runs without a daemon password; `paseo daemon
+    set-password` adds one if wanted.
+    """
+    config = read_json(paseo_config)
+    current = paseo_listen(config)
+    new_listen = paseo_listen_update(config, opts.paseo_listen)
+    if new_listen is None:
+        say(f"Paseo daemon listen address unchanged: {current}")
+        return
+    backup(paseo_config)
+    config.setdefault("daemon", {})["listen"] = new_listen
+    write_json(paseo_config, config)
+    port = split_listen(new_listen)[1]
+    say(f"Paseo daemon listens on {new_listen}; other devices connect to this machine's address on port {port}.", "ok")
+
+
 def write_launcher(path, command, environment=None, path_prepend=None):
     path = Path(path)
     if (path.exists() or path.is_symlink()) and not launcher_is_owned(path):
@@ -471,7 +556,7 @@ def masked_input(prompt):
     value = []
     try:
         termios.tcsetattr(fd, termios.TCSAFLUSH, masked)
-        sys.stderr.write(prompt)
+        sys.stderr.write(paint(prompt, "prompt"))
         sys.stderr.flush()
         while True:
             char = sys.stdin.read(1)
@@ -579,6 +664,54 @@ def write_all(fd, data):
         view = view[os.write(fd, view):]
 
 
+URL_TAIL = re.compile(rb"[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]{1,8}$")
+
+
+class UrlUnwrapper:
+    """Rejoin the tail Claude Code's non-terminal renderer wraps off a long URL.
+
+    When its output is not a terminal, Claude Code wraps the sign-in URL one
+    or a few characters early whatever the terminal width, leaving them alone
+    on the next line. This holds a line containing a URL until the next one
+    arrives and appends such a tail to it. Incomplete lines are held too, so a
+    URL arriving in pieces is still recognized; the caller flushes them after
+    a short pause so a prompt without a trailing newline still shows.
+    """
+
+    IDLE_FLUSH_SECONDS = 0.05
+
+    def __init__(self):
+        self.pending = b""
+        self.held = None
+
+    @property
+    def waiting(self):
+        return self.held is not None or bool(self.pending)
+
+    def feed(self, data):
+        out = []
+        self.pending += data
+        while True:
+            newline = self.pending.find(b"\n")
+            if newline < 0:
+                break
+            line, self.pending = self.pending[:newline], self.pending[newline + 1:]
+            visible = TERMINAL_CONTROL.sub("", line.decode("utf-8", "replace")).strip().encode()
+            if self.held is not None:
+                out.append(self.held + (line if URL_TAIL.fullmatch(visible) else b"\n" + line) + b"\n")
+                self.held = None
+            elif b"https://" in visible:
+                self.held = line
+            else:
+                out.append(line + b"\n")
+        return b"".join(out)
+
+    def flush(self):
+        out = (self.held + b"\n" if self.held is not None else b"") + self.pending
+        self.held, self.pending = None, b""
+        return out
+
+
 def run_on_terminal(argv, env, stdin_fd=None, stdout_fd=None):
     """Run an interactive command, relaying it to this terminal and capturing its output.
 
@@ -611,14 +744,25 @@ def run_on_terminal(argv, env, stdin_fd=None, stdout_fd=None):
     os.close(slave)
     output = child.stdout.fileno()
     captured = []
+    display = UrlUnwrapper()
     original_handler = signal.signal(signal.SIGWINCH, resize)
     original_mode = termios.tcgetattr(stdin_fd)
-    tty.setraw(stdin_fd)
+    # Pass keys through unbuffered and unechoed, but keep output processing so
+    # the relayed screens' newlines still return to the first column.
+    relay_mode = original_mode[:]
+    relay_mode[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK | termios.ISTRIP | termios.IXON)
+    relay_mode[3] &= ~(termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG)
+    relay_mode[6] = original_mode[6][:]
+    relay_mode[6][termios.VMIN] = 1
+    relay_mode[6][termios.VTIME] = 0
+    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, relay_mode)
     try:
         watched = [output, master, stdin_fd]
         interrupts = 0
         while output in watched:
-            ready, _, _ = select.select(watched, [], [])
+            ready, _, _ = select.select(watched, [], [], display.IDLE_FLUSH_SECONDS if display.waiting else None)
+            if not ready:
+                write_all(stdout_fd, display.flush())
             for fd in ready:
                 try:
                     data = os.read(fd, 65536)
@@ -636,10 +780,12 @@ def run_on_terminal(argv, env, stdin_fd=None, stdout_fd=None):
                         # signal for Ctrl-C; deliver one (twice: terminate).
                         interrupts += 1
                         child.send_signal(signal.SIGINT if interrupts == 1 else signal.SIGTERM)
+                elif fd == output:
+                    captured.append(data)
+                    write_all(stdout_fd, display.feed(data))
                 else:
-                    if fd == output:
-                        captured.append(data)
                     write_all(stdout_fd, data)
+        write_all(stdout_fd, display.flush())
     finally:
         termios.tcsetattr(stdin_fd, termios.TCSADRAIN, original_mode)
         signal.signal(signal.SIGWINCH, original_handler)
@@ -692,12 +838,15 @@ def acquire_peppy_token(settings):
     happen in the same run. Returns None when the user skips or the sign-in
     fails; the installation is complete either way and the fallback is printed.
     """
-    say("Paseo runs the second account's sessions in the daemon's Claude profile and selects the")
-    say("account with a long-lived token. Press Enter to sign in with the second account in the browser")
-    say("and generate the token now, paste an existing token from claude setup-token, or type skip.")
-    say("The token stays in this installation's private settings; it is not written into Paseo's configuration.")
+    say("In Paseo, 'Claude Peppy' agents run as your second Claude account. To sign in as that account,")
+    say("Paseo needs a long-lived Claude Code token (what `claude setup-token` prints; valid for one year).")
+    say("You do not need to have one yet: the installer can create it for you now.")
+    say("  Enter      sign in as the second account in the browser now; the token is created and saved")
+    say("  paste      if you already ran `claude-peppy setup-token`, paste its token (it starts with sk-ant-oat01-)")
+    say("  skip       set this up later by rerunning ./install.sh")
+    say("The token is stored only in this installation's private settings, never in Paseo's configuration.")
     try:
-        value = masked_input("Second account token (masked with *; Enter to sign in now; type skip to skip): ").strip()
+        value = masked_input("Second account token (Enter to sign in now, paste a token, or type skip): ").strip()
     except (EOFError, OSError, ValueError, termios.error):
         raise SetupError("Cannot read a masked token; use --peppy-oauth-token-file or CLAUDE_PEPPY_OAUTH_TOKEN") from None
     if value.lower() == "skip":
@@ -708,16 +857,16 @@ def acquire_peppy_token(settings):
     try:
         token = sign_in_second_account(settings)
     except SetupError as exc:
-        say(f"{exc}; no token was saved for the second account's Paseo sessions.")
-        say(SETUP_TOKEN_FALLBACK)
+        say(f"{exc}; no token was saved for the second account's Paseo sessions.", "warn")
+        say(SETUP_TOKEN_FALLBACK, "warn")
         return None
-    say("Saved the second account's token for Paseo.")
+    say("Saved the second account's token for Paseo.", "ok")
     return token
 
 
 def ask(prompt):
     """Read one line of plain (non-secret) input from the terminal; EOF counts as an empty answer."""
-    sys.stderr.write(prompt)
+    sys.stderr.write(paint(prompt, "prompt"))
     sys.stderr.flush()
     line = sys.stdin.readline()
     return line.strip()
@@ -785,6 +934,9 @@ def parser():
                              help="When no Paseo is detected, install the latest release without asking "
                                   "(Homebrew cask on macOS, npm install -g elsewhere)")
     p.add_argument("--skip-paseo-start", action="store_true", help="Write Paseo configuration without restarting its daemon")
+    p.add_argument("--paseo-listen", default="0.0.0.0", metavar="HOST[:PORT]",
+                   help="Where the Paseo daemon listens when it is still on loopback (default: 0.0.0.0, all interfaces, "
+                        "keeping the port). Use 'keep' to leave it unchanged")
     p.add_argument("--no-path", action="store_true", help="Do not edit shell startup files")
     return p
 
@@ -821,6 +973,7 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     if use_peppy and peppy_dir in (absolute(Path.home() / ".claude"), absolute(config_dir / "claude")):
         raise SetupError("--peppy-config-dir must not be the primary Claude profile ~/.claude "
                          "or the installer's isolated Claude profile")
+    step("Paseo")
     detected_paseo = None if opts.skip_paseo else detect_paseo(opts.paseo_bin, previous.get("paseo_bin"), data_dir)
     paseo_skip_reason = "Paseo integration skipped" if opts.skip_paseo else "Paseo not detected"
     if detected_paseo is None and not opts.skip_paseo:
@@ -833,6 +986,7 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
             paseo_skip_reason += " (pass --install-paseo to install it)"
     if detected_paseo:
         assert_original_binary(detected_paseo, bin_dir, ("paseo-codex",), "--paseo-bin", "Paseo")
+        say(f"Using installed Paseo: {detected_paseo}", "ok")
     use_paseo = detected_paseo is not None
     if use_peppy and not use_paseo and previous.get("peppy_config_dir"):
         # A retained Paseo provider entry keeps pinning the old profile; moving
@@ -849,7 +1003,7 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
                                  "untouched; rerun with Paseo detected so the claude-peppy provider entry "
                                  "can be updated, or remove that entry first")
     if not use_paseo:
-        say(f"{paseo_skip_reason}; skipping Paseo configuration")
+        say(f"{paseo_skip_reason}; skipping Paseo configuration", "warn")
     paseo_home = absolute(opts.paseo_home)
     paseo_config = paseo_home / "config.json"
     if use_paseo:
@@ -872,13 +1026,20 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
         if (path.exists() or path.is_symlink()) and not launcher_is_owned(path):
             raise SetupError(f"Refusing to overwrite unrelated program {path}")
     # Validate before downloads, stopping services, or replacing configuration.
+    step("Plane read-only connection")
     plane_key = prepare_plane(opts, previous, config_dir, data_dir, plane_environment_key)
+    if plane_key is not None:
+        say("Plane read-only connector for peppy: configured with this installation; authentication is checked "
+            "on the first read.", "ok")
+    elif previous.get("plane_mcp_config"):
+        say("Plane setup skipped; the existing connection and credentials are retained.")
+    else:
+        say("Plane setup skipped; no connection configured. Rerun interactively or use --plane-api-key-file.", "warn")
     peppy_token = prepare_peppy_token(opts, previous, peppy_environment_token) if use_peppy else None
+    step("Installing Claude Code, CLIProxyAPI, and the launchers")
     claude_bin = resolve_cli("claude", opts.claude_bin, f"@anthropic-ai/claude-code@{CLAUDE_VERSION}", data_dir, previous.get("claude_bin"))
     assert_original_binary(claude_bin, bin_dir, ("claude-codex", "claude-peppy"), "--claude-bin", "Claude")
     paseo_bin = detected_paseo
-    if paseo_bin:
-        say(f"Using installed Paseo: {paseo_bin}")
     proxy_bin = executable(opts.proxy_binary, "CLIProxyAPI") if opts.proxy_binary else str(install_proxy(data_dir, opts.proxy_version))
     settings = {
         "config_dir": str(config_dir), "data_dir": str(data_dir), "state_dir": str(state_dir),
@@ -910,12 +1071,8 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     atomic_write(runtime_file, Path(__file__).with_name("claude_codex.py").read_text())
     if plane_key is not None:
         settings["plane_mcp_config"] = configure_plane(config_dir, data_dir, plane_key)
-        say("Plane read-only connector configured for peppy; authentication will be checked on the first read.")
     elif previous.get("plane_mcp_config"):
         settings["plane_mcp_config"] = previous["plane_mcp_config"]
-        say("Plane setup skipped; the existing connection and credentials were retained.")
-    else:
-        say("Plane setup skipped; no connection configured. Rerun interactively or use --plane-api-key-file.")
     write_json(settings_file, settings)
     write_json(config_dir / "proxy.yaml", proxy_config(settings))
     # Keep the native claude profile untouched. Project CLAUDE.md and settings
@@ -938,6 +1095,7 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     runtime = Runtime(settings)
     codex_login_skipped = False
     if not opts.skip_login:
+        step("Claude Codex: ChatGPT sign-in and verification")
         # An existing ChatGPT login is verified without asking; a first sign-in
         # can be declined, leaving Claude Codex staged and the other steps running.
         if runtime.has_login():
@@ -952,28 +1110,36 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
             runtime.doctor(smoke=not opts.skip_smoke_test)
         else:
             codex_login_skipped = True
-            say(CODEX_LOGIN_SKIPPED)
+            say(CODEX_LOGIN_SKIPPED, "warn")
         if use_paseo and use_peppy and not peppy_token and sys.stdin.isatty():
+            step("Second Claude account: token for Paseo sessions")
             peppy_token = acquire_peppy_token(settings)
             if peppy_token:
                 settings["peppy_oauth_token"] = peppy_token
                 write_json(settings_file, settings)
-    if paseo_bin and not opts.skip_paseo_start:
+    if paseo_bin:
         env = dict(os.environ)
         env["PASEO_HOME"] = str(paseo_home)
         # Explicitly target this machine; ignore inherited remote daemon selectors.
         env.pop("PASEO_HOST", None)
-        say(f"Restarting the local Paseo daemon with {paseo_bin}...")
-        subprocess.run([paseo_bin, "daemon", "restart"], env=env, check=True)
-        subprocess.run([paseo_bin, "reload"], env=env, check=True)
-    say(f"Installed: {bin_dir / 'claude-codex'}")
+        step("Paseo daemon: network access and restart")
+        configure_paseo_network(paseo_config, opts)
+        if opts.skip_paseo_start:
+            say("Paseo daemon not restarted (--skip-paseo-start); run paseo-codex daemon restart to apply the "
+                "configuration.", "warn")
+        else:
+            say(f"Restarting the local Paseo daemon with {paseo_bin}...")
+            subprocess.run([paseo_bin, "daemon", "restart"], env=env, check=True)
+            subprocess.run([paseo_bin, "reload"], env=env, check=True)
+    step("Done")
+    say(f"Installed: {bin_dir / 'claude-codex'}", "ok")
     say(f"Run: {shlex.quote(str(bin_dir / 'claude-codex'))} --reasoning high")
     if use_peppy:
         say(f"Second account: {bin_dir / 'claude-peppy'} (profile {peppy_dir}); run it once to sign in.")
         if paseo_bin and not peppy_token:
             say("No token is saved for the second account's Paseo sessions; the Claude Peppy provider refuses "
-                "to start sessions until one is.")
-            say(SETUP_TOKEN_FALLBACK)
+                "to start sessions until one is.", "warn")
+            say(SETUP_TOKEN_FALLBACK, "warn")
     if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
         say(f'For this terminal: export PATH={shlex.quote(str(bin_dir))}:"$PATH" (or open a new terminal)')
     if paseo_bin:
@@ -982,9 +1148,9 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
             say("In Paseo, select 'Claude Peppy' to use the second Claude account.")
         say("Paseo plugin 'claude-codex' installed; check it with: paseo-codex plugin ls")
     if codex_login_skipped:
-        say(CODEX_LOGIN_SKIPPED)
+        say(CODEX_LOGIN_SKIPPED, "warn")
     if opts.skip_login:
-        say("Installation staged; login and live verification were skipped. Run claude-codex-proxy login when ready.")
+        say("Installation staged; login and live verification were skipped. Run claude-codex-proxy login when ready.", "warn")
 
 
 if __name__ == "__main__":

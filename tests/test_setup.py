@@ -336,8 +336,8 @@ class InstallTests(unittest.TestCase):
                 original_write(path, value)
             install.write_json = write_json
             original_say = install.say
-            def say(message):
-                original_say(message)
+            def say(message, tone=None):
+                original_say(message, tone)
                 if role == "first" and message.startswith("Installation staged;"):
                     emit("transaction-end")
                     gate()
@@ -1005,13 +1005,16 @@ class InstallTests(unittest.TestCase):
              patch.object(install, "say") as say:
             self.assertEqual(install.acquire_peppy_token(settings), "sk-ant-oat01-generated")
             sign_in.assert_called_once_with(settings)
-            prompt.assert_called_once_with("Second account token (masked with *; Enter to sign in now; type skip to skip): ")
-            self.assertTrue(any("Enter to sign in" in call.args[0] for call in say.call_args_list))
-            self.assertFalse(any("sk-ant-oat01" in call.args[0] for call in say.call_args_list))
+            prompt.assert_called_once_with("Second account token (Enter to sign in now, paste a token, or type skip): ")
+            messages = [call.args[0] for call in say.call_args_list]
+            self.assertTrue(any("You do not need to have one yet" in message for message in messages))
+            self.assertTrue(any("claude-peppy setup-token" in message for message in messages))
+            self.assertFalse(any("sk-ant-oat01-generated" in call.args[0] for call in say.call_args_list))
             # A pasted token is used as is; skip saves nothing and does not sign in.
             sign_in.reset_mock()
             prompt.return_value = " sk-ant-oat01-pasted \n"
             self.assertEqual(install.acquire_peppy_token(settings), "sk-ant-oat01-pasted")
+            self.assertFalse(any("sk-ant-oat01-pasted" in call.args[0] for call in say.call_args_list))
             prompt.return_value = "SKIP"
             self.assertIsNone(install.acquire_peppy_token(settings))
             sign_in.assert_not_called()
@@ -1050,6 +1053,30 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(install.printed_oauth_tokens(b"\r\nsk-ant-oat02-newer_format\r\n\r\n"), {"sk-ant-oat02-newer_format"})
         self.assertEqual(install.printed_oauth_tokens(b"Browser didn't open? Use the url below\r\n"), set())
 
+    def test_url_unwrapper_rejoins_wrapped_url_tail_and_passes_prompts_through(self):
+        url = "https://claude.com/cai/oauth/authorize?code=true&state=" + "x" * 300 + "M"
+        link = lambda text: f"\x1b]8;id=1;{url}\x07{text}\x1b]8;;\x07".encode()
+        frame = (b" Browser didn't open? Use the url below to sign in (c to copy)\n\n"
+                 + link(url[:-1]) + b"\n" + link("M") + b"\n\n Paste code here if prompted >\n")
+        expected = (b" Browser didn't open? Use the url below to sign in (c to copy)\n\n"
+                    + link(url[:-1]) + link("M") + b"\n\n Paste code here if prompted >\n")
+        unwrapper = install.UrlUnwrapper()
+        self.assertEqual(unwrapper.feed(frame) + unwrapper.flush(), expected)
+        # The same frame arriving in arbitrary chunks gives the same display.
+        for size in (1, 7, 64):
+            unwrapper = install.UrlUnwrapper()
+            shown = b"".join(unwrapper.feed(frame[i:i + size]) for i in range(0, len(frame), size)) + unwrapper.flush()
+            self.assertEqual(shown, expected, size)
+        # Ordinary lines after a URL stay separate; an incomplete line waits for the idle flush.
+        unwrapper = install.UrlUnwrapper()
+        self.assertEqual(unwrapper.feed(b"see https://example.com/a\nnext step\nPaste code here >"),
+                         b"see https://example.com/a\nnext step\n")
+        self.assertTrue(unwrapper.waiting)
+        self.assertEqual(unwrapper.flush(), b"Paste code here >")
+        self.assertFalse(unwrapper.waiting)
+        self.assertEqual(unwrapper.feed(b"https://example.com/b\n"), b"")
+        self.assertEqual(unwrapper.flush(), b"https://example.com/b\n")
+
     def test_run_on_terminal_relays_input_and_captures_output(self):
         # Like Claude Code: keys arrive from a terminal, screens go to a pipe.
         tool = self.fake_cli("interactive-tool", textwrap.dedent("""\
@@ -1057,13 +1084,13 @@ class InstallTests(unittest.TestCase):
             signal.signal(signal.SIGINT, lambda *_: sys.exit(7))
             assert sys.stdin.isatty() and not sys.stdout.isatty()
             assert os.open("/dev/tty", os.O_RDWR) > 2
-            print("Paste code here:", flush=True)
+            print("Paste code here:", end="", flush=True)  # no newline: relies on the idle flush
             tty.setraw(0)
             code = b""
             while not code.endswith(b"\\r"):
                 code += os.read(0, 1)
             code = code.strip().decode()
-            print("Paste code here: " + code, flush=True)
+            print(" " + code, flush=True)
             print("\\x1b[33msk-ant-oat01-" + code + "\\x1b[39m\\n\\nsize=" + repr(os.get_terminal_size(0)), file=sys.stderr, flush=True)
             raise SystemExit(3 if code == "fail" else 0)
         """))
@@ -1073,11 +1100,18 @@ class InstallTests(unittest.TestCase):
                 self.addCleanup(os.close, user_master)
                 shown = []
 
+                modes = []
+
                 def act_as_user():
                     buffered = b""
                     while b"Paste code here:" not in buffered:
                         buffered += os.read(user_master, 4096)
-                    os.write(user_master, (code + "\r").encode())  # Enter, as a raw-mode terminal sends it
+                    # While relaying: no echo or line buffering, but output processing stays on.
+                    attributes = install.termios.tcgetattr(user_tty)
+                    modes.append((attributes[3] & install.termios.ECHO, attributes[3] & install.termios.ICANON,
+                                  attributes[1] & install.termios.OPOST))
+                    # Enter as a raw-mode terminal sends it; Ctrl-C alone must end the tool by signal.
+                    os.write(user_master, (code + ("" if code == "\x03" else "\r")).encode())
                     while code != "\x03":
                         try:
                             chunk = os.read(user_master, 4096)
@@ -1102,14 +1136,36 @@ class InstallTests(unittest.TestCase):
                 os.close(user_tty)
                 self.assertEqual(status, expected_status)
                 self.assertIn(b"Paste code here:", captured)
+                self.assertEqual(modes, [(0, 0, install.termios.OPOST)])
                 if code == "\x03":
                     # Raw-mode keys generate no signal; the runner delivers Ctrl-C itself.
                     self.assertEqual(install.printed_oauth_tokens(captured), set())
                     continue
                 self.assertEqual(install.printed_oauth_tokens(captured), {"sk-ant-oat01-" + code})
                 self.assertIn(b"size=os.terminal_size(columns=", captured)
-                # The user's terminal saw everything the tool printed, in order.
+                # The user's terminal saw everything the tool printed, in order,
+                # with newlines carrying a carriage return.
+                self.assertIn(f"Paste code here: {code}\r\n".encode(), shown[0])
                 self.assertLess(shown[0].index(b"Paste code here:"), shown[0].index(("sk-ant-oat01-" + code).encode()))
+
+    def test_output_tones_apply_only_on_a_color_terminal(self):
+        with patch.object(install.sys.stderr, "isatty", return_value=True), patch.dict(os.environ, {"TERM": "xterm-256color"}, clear=False):
+            os.environ.pop("NO_COLOR", None)
+            self.assertEqual(install.paint("Installed", "ok"), "\x1b[32mInstalled\x1b[0m")
+            self.assertEqual(install.paint("plain", None), "plain")
+            with patch.object(install, "emit") as emit:
+                install.step("Paseo")
+                install.say("Run: claude-codex")
+                self.assertEqual([c.args[0] for c in emit.call_args_list], ["", "\x1b[1;36m▸ Paseo\x1b[0m", "Run: claude-codex"])
+            with patch.dict(os.environ, {"NO_COLOR": "1"}):
+                self.assertEqual(install.paint("Installed", "ok"), "Installed")
+            with patch.dict(os.environ, {"TERM": "dumb"}):
+                self.assertEqual(install.paint("Installed", "ok"), "Installed")
+        with patch.object(install.sys.stderr, "isatty", return_value=False):
+            self.assertEqual(install.paint("Installed", "ok"), "Installed")
+            with patch.object(install, "emit") as emit:
+                install.step("Paseo")
+                self.assertEqual([c.args[0] for c in emit.call_args_list], ["", "▸ Paseo"])
 
     def test_paseo_install_command_follows_platform(self):
         def which(available):
@@ -1227,6 +1283,72 @@ class InstallTests(unittest.TestCase):
             command_lookup.assert_not_called()
             installer.assert_not_called()
             self.assertIn("Paseo integration skipped; skipping Paseo configuration", [call.args[0] for call in say.call_args_list])
+
+    def test_paseo_listen_update_changes_only_loopback_listeners(self):
+        cases = (
+            ({}, "0.0.0.0", "0.0.0.0:6767"),
+            ({"daemon": {"listen": "127.0.0.1:7000"}}, "0.0.0.0", "0.0.0.0:7000"),
+            ({"daemon": {"listen": "6767"}}, "0.0.0.0", "0.0.0.0:6767"),
+            ({"daemon": {"listen": "localhost:6767"}}, "0.0.0.0:8000", "0.0.0.0:8000"),
+            ({"daemon": {"listen": "[::1]:6767"}}, "[::]", "[::]:6767"),
+            ({"daemon": {"listen": "100.101.102.103:6767"}}, "0.0.0.0", None),  # a deliberate address
+            ({"daemon": {"listen": "/tmp/paseo.sock"}}, "0.0.0.0", None),  # a socket
+            ({}, "keep", None),
+            ({}, "127.0.0.1", None),
+        )
+        for config, requested, expected in cases:
+            with self.subTest(config=config, requested=requested):
+                self.assertEqual(install.paseo_listen_update(config, requested), expected)
+        for bad in ("/tmp/paseo.sock", "0.0.0.0:port"):
+            with self.assertRaisesRegex(runtime.SetupError, "--paseo-listen"):
+                install.paseo_listen_update({}, bad)
+
+    def test_paseo_network_access_opens_loopback_listeners(self):
+        config_file = self.base / "paseo-home" / "config.json"
+        config_file.parent.mkdir()
+        opts = install.parser().parse_args(self.staged_args())
+
+        def run(listen="0.0.0.0", **daemon):
+            runtime.write_json(config_file, {"version": 1, "daemon": {"listen": "127.0.0.1:6767", **daemon}, "agents": {}})
+            opts.paseo_listen = listen
+            with patch.object(install, "say") as say:
+                install.configure_paseo_network(config_file, opts)
+            return runtime.read_json(config_file)["daemon"], [call.args[0] for call in say.call_args_list]
+
+        daemon, messages = run(relay={"enabled": False})
+        self.assertEqual(daemon, {"listen": "0.0.0.0:6767", "relay": {"enabled": False}})
+        self.assertTrue(any(message.startswith("Paseo daemon listens on 0.0.0.0:6767") for message in messages))
+        self.assertFalse(any("password" in message for message in messages))
+        self.assertTrue(list(config_file.parent.glob("config.json.claude-codex-backup-*")))
+        daemon, messages = run(listen="keep")
+        self.assertEqual(daemon, {"listen": "127.0.0.1:6767"})
+        self.assertIn("Paseo daemon listen address unchanged: 127.0.0.1:6767", messages)
+
+    def test_install_configures_paseo_network_before_restarting(self):
+        paseo = self.fake_paseo("paseo", "print('paseo')\n")
+        paseo_config = self.base / "paseo-home" / "config.json"
+        paseo_config.parent.mkdir()
+        runtime.write_json(paseo_config, {"version": 1, "daemon": {"listen": "127.0.0.1:6767"}})
+        opts = install.parser().parse_args(self.staged_args("--paseo-bin", str(paseo)))
+        with patch.object(install, "say") as say:
+            install.install(opts)
+        messages = [call.args[0] for call in say.call_args_list]
+        self.assertEqual(runtime.read_json(paseo_config)["daemon"]["listen"], "0.0.0.0:6767")
+        self.assertIn("claude-codex", runtime.read_json(paseo_config)["agents"]["providers"])
+        self.assertTrue(any(message.startswith("Paseo daemon not restarted (--skip-paseo-start)") for message in messages))
+        # The restart happens after the configuration is written.
+        opts.skip_paseo_start = False
+        seen = []
+        def restart(command, **kwargs):
+            seen.append((command[1:], runtime.read_json(paseo_config)["daemon"]["listen"]))
+            return subprocess.CompletedProcess(command, 0)
+        with patch.object(install.subprocess, "run", side_effect=restart), patch.object(install, "say"):
+            install.install(opts)
+        self.assertEqual(seen, [(["daemon", "restart"], "0.0.0.0:6767"), (["reload"], "0.0.0.0:6767")])
+        # --paseo-listen keep leaves an existing listener alone.
+        runtime.write_json(paseo_config, {"version": 1, "daemon": {"listen": "127.0.0.1:6767"}})
+        install.install(install.parser().parse_args(self.staged_args("--paseo-bin", str(paseo), "--paseo-listen", "keep")))
+        self.assertEqual(runtime.read_json(paseo_config)["daemon"]["listen"], "127.0.0.1:6767")
 
     def test_codex_sign_in_can_be_declined_interactively_or_by_flag(self):
         paseo = self.fake_paseo("paseo", "print('paseo')\n")
