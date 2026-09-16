@@ -14,7 +14,7 @@ import threading
 import time
 import unittest
 
-from test_proxy_integration import GatedReadSequence, Upstream, free_port, function_call_events, response_events
+from test_proxy_integration import Upstream, free_port
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -32,9 +32,9 @@ def copy_paseo_package(binary, destination):
         raise AssertionError(f"Cannot locate the selected Paseo CLI package for {entrypoint}")
     reader = Path("node_modules/@getpaseo/server/dist/server/server/agent/providers/claude/agent.js")
     if not (root / reader).is_file():
-        raise AssertionError(f"Selected CLI has no bundled server usage reader at {root / reader}")
-    # Dereference package/.bin links as regular private files too. In particular,
-    # no installer patch may resolve back into the user's installed server.
+        raise AssertionError(f"Selected CLI has no bundled Claude provider module at {root / reader}")
+    # Dereference package/.bin links as regular private files too, so the
+    # private daemon never resolves back into the user's installed server.
     shutil.copytree(root, destination, symlinks=False)
     private_entrypoint = destination / entrypoint.relative_to(root)
     private_reader = destination / reader
@@ -46,70 +46,6 @@ def copy_paseo_package(binary, destination):
         if private.samefile(source):
             raise AssertionError(f"Private copy shares an inode with {source}")
     return private_entrypoint
-
-
-class ForkedSkillScenario:
-    """Skill fork → background Agent grandchild → fork result, as Claude Code runs it.
-
-    The fork's final request is held until the grandchild has finished, so the
-    child's completion is announced while the fork is still running.
-    """
-
-    SKILL = ("---\nname: forky\ndescription: harness fork skill\ncontext: fork\n---\n"
-             "FORKY-SKILL-BODY: spawn a background helper and report.\n")
-    CHILD_PROMPT = "SUBAGENT-PROMPT say done"
-
-    def __init__(self, project, fork_delay=6.0):
-        skill = project / ".claude" / "skills" / "forky" / "SKILL.md"
-        skill.parent.mkdir(parents=True, exist_ok=True)
-        skill.write_text(self.SKILL)
-        self.fork_delay = fork_delay
-        self.kinds = []
-        self.child_started = threading.Event()
-        self.lock = threading.Lock()
-
-    @staticmethod
-    def text_of(item):
-        content = item.get("content")
-        if isinstance(content, str):
-            return content
-        return " ".join(part.get("text", "") for part in content or [] if isinstance(part, dict))
-
-    def classify(self, body):
-        inputs = body.get("input", [])
-        blob = json.dumps(inputs)
-        user_texts = [self.text_of(item) for item in inputs if item.get("role") == "user"]
-        has_result = any(item.get("type") == "function_call_output" for item in inputs)
-        if "<transcript>" in blob:
-            return "classifier"
-        if user_texts and "task-notification" in user_texts[-1]:
-            return "main-notified"
-        if any(self.CHILD_PROMPT in text for text in user_texts) and not has_result:
-            return "child"
-        if "FORKY-SKILL-BODY" in blob:
-            return "fork-after-tool" if has_result else "fork-first"
-        return "main-after-tool" if has_result else "main-first"
-
-    def events_for(self, body):
-        kind = self.classify(body)
-        with self.lock:
-            self.kinds.append(kind)
-        if kind == "main-first":
-            return function_call_events("Skill", {"skill": "forky"})
-        if kind == "fork-first":
-            return function_call_events("Agent", {"description": "grandchild bg", "prompt": self.CHILD_PROMPT,
-                                                  "subagent_type": "general-purpose", "run_in_background": True})
-        if kind == "child":
-            self.child_started.set()
-            return response_events(text="sub done")
-        if kind == "fork-after-tool":
-            self.child_started.wait(timeout=30)
-            time.sleep(self.fork_delay)
-            return response_events(text="fork OK")
-        return response_events(text="OK")
-
-    def close(self):
-        pass
 
 
 FAKE_PEPPY_CLAUDE = r'''
@@ -212,16 +148,7 @@ class PaseoIntegrationTests(unittest.TestCase):
     def test_context_meter_uses_final_input_and_cached_tokens(self):
         self.run_paseo_session("max", check_usage=True)
 
-    def test_context_meter_updates_between_tools_during_first_running_turn(self):
-        self.run_paseo_session("max", check_live_usage=True, paseo_patch=True)
-
-    def test_forked_skill_subagents_finish_live_and_after_daemon_restart(self):
-        self.run_paseo_session("high", check_forked_skill=True, paseo_patch=True)
-
-    def test_auto_mode_is_not_offered_and_falls_back_to_prompting(self):
-        self.run_paseo_session("high", check_auto_mode=True, paseo_patch=True)
-
-    def test_plugin_keeps_new_agents_out_of_auto_mode_without_the_patch(self):
+    def test_plugin_keeps_agents_requesting_auto_mode_in_prompting_mode(self):
         self.run_paseo_session("high", check_auto_mode=True)
 
     def isolated_daemon_environment(self, base):
@@ -320,16 +247,14 @@ class PaseoIntegrationTests(unittest.TestCase):
                 subprocess.run([paseo, "daemon", "stop", "--timeout", "10"], env=env,
                                capture_output=True, text=True, timeout=30)
 
-    def run_paseo_session(self, effort, thinking=None, check_usage=False, check_live_usage=False,
-                          check_forked_skill=False, check_auto_mode=False, paseo_patch=False):
+    def run_paseo_session(self, effort, thinking=None, check_usage=False, check_auto_mode=False):
         with tempfile.TemporaryDirectory(prefix="claude-codex-paseo-") as temp:
             base = Path(temp)
             private_root = base / "private-paseo-cli"
             private_paseo = copy_paseo_package(os.environ["PASEO_TEST_BINARY"], private_root)
             client_module = private_root / "dist" / "utils" / "client.js"
             env, _, _, daemon_profile = self.isolated_daemon_environment(base)
-            install_command = self.install_command(base, os.environ["CLAUDE_TEST_BINARY"],
-                                                   str(private_paseo), *(["--paseo-patch"] if paseo_patch else []))
+            install_command = self.install_command(base, os.environ["CLAUDE_TEST_BINARY"], str(private_paseo))
             for attempt in range(2):
                 result = subprocess.run(install_command, env=env, stdin=subprocess.DEVNULL,
                                         capture_output=True, text=True, timeout=30)
@@ -376,14 +301,8 @@ class PaseoIntegrationTests(unittest.TestCase):
                     selected = next(model for model in models if model["id"] == runtime.ULTRACODE_MODEL)
                     self.assertIn("Ultra Code", selected["label"])
                     self.assertEqual(selected["thinkingOptions"][0]["id"], "ultracode")
-                if check_live_usage:
-                    self.run_live_context_session(paseo, client_module, env, base, daemon_profile, upstream)
-                    return
-                if check_forked_skill:
-                    self.run_forked_skill_session(paseo, client_module, env, base, upstream)
-                    return
                 if check_auto_mode:
-                    self.run_auto_mode_session(paseo, client_module, env, base, upstream, paseo_patch)
+                    self.run_auto_mode_session(paseo, client_module, env, base, upstream)
                     return
                 result = subprocess.run([
                     paseo, "run", "--provider", "claude-codex", "--model", runtime.model_id(effort),
@@ -476,45 +395,7 @@ class PaseoIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr[-3000:] + result.stdout[-3000:])
         return result
 
-    def run_forked_skill_session(self, paseo, client_module, env, base, upstream):
-        project = base / "project"
-        project.mkdir()
-        scenario = ForkedSkillScenario(project)
-        upstream.sequence = scenario
-        result = self.run_paseo(paseo, env, "run", "--provider", "claude-codex", "--model", runtime.model_id("high"),
-                                "--mode", "bypassPermissions", "--cwd", str(project), "--wait-timeout", "120s",
-                                "--json", "Do the thing.")
-        agent_id = re.search(r'"agentId"\s*:\s*"([^"]+)"', result.stdout).group(1)
-        self.assertEqual(scenario.kinds[:4], ["main-first", "fork-first", "child", "fork-after-tool"], scenario.kinds)
-
-        def check(snapshot, phase):
-            rows = {row["title"]: row for row in snapshot["subagents"]}
-            self.assertEqual(sorted(rows), ["forky", "general-purpose"], f"{phase}: {snapshot['subagents']}")
-            fork, child = rows["forky"], rows["general-purpose"]
-            self.assertEqual(fork["status"], "completed", f"{phase}: the forked skill never finished: {fork}")
-            self.assertEqual(child["status"], "completed", f"{phase}: {child}")
-            self.assertEqual(child["parentSubagentId"], fork["id"], f"{phase}: the grandchild must nest under the fork")
-            self.assertEqual(child["description"], "grandchild bg")
-            self.assertTrue(fork["subtitle"].startswith("forky · gpt-6-astra"), fork["subtitle"])
-            tool_calls = [item for item in snapshot["timeline"] if item.get("type") == "tool_call"]
-            self.assertEqual([(item["name"], item["status"]) for item in tool_calls], [("Skill", "completed")],
-                             f"{phase}: no dangling Task card may remain in the parent transcript")
-
-        deadline = time.monotonic() + 30
-        while True:
-            snapshot = self.fetch_agent(client_module, env, agent_id, with_timeline=True)
-            statuses = {row["status"] for row in snapshot["subagents"]}
-            if (snapshot["status"] == "idle" and statuses == {"completed"}) or time.monotonic() >= deadline:
-                break
-            time.sleep(0.5)
-        self.assertEqual(snapshot["status"], "idle", snapshot)
-        check(snapshot, "live")
-        # A fresh daemon rebuilds the same rows from the transcripts on disk.
-        self.run_paseo(paseo, env, "daemon", "restart", "--json", timeout=90)
-        restored = self.fetch_agent(client_module, env, agent_id, with_timeline=True)
-        check(restored, "after restart")
-
-    def run_auto_mode_session(self, paseo, client_module, env, base, upstream, paseo_patch):
+    def run_auto_mode_session(self, paseo, client_module, env, base, upstream):
         project = base / "project"
         project.mkdir()
         plugins = self.run_paseo(paseo, env, "plugin", "ls", "--json")
@@ -528,10 +409,6 @@ class PaseoIntegrationTests(unittest.TestCase):
         snapshot = self.fetch_agent(client_module, env, default_agent)
         self.assertEqual(snapshot["runtimeModeId"], "default", snapshot)
         self.assertIn("bypassPermissions", snapshot["availableModes"], snapshot)
-        if paseo_patch:
-            # The legacy patch also removes auto mode from the advertised catalog.
-            self.assertEqual(snapshot["currentModeId"], "default", snapshot)
-            self.assertNotIn("auto", snapshot["availableModes"], snapshot)
         # An agent that explicitly asks for auto mode, such as one created from
         # an older profile, is created in the prompting mode by the plugin's
         # hook, and Claude runs it that way.
@@ -541,96 +418,12 @@ class PaseoIntegrationTests(unittest.TestCase):
         snapshot = self.fetch_agent(client_module, env, auto_agent)
         self.assertEqual(snapshot["currentModeId"], "default", snapshot)
         self.assertEqual(snapshot["runtimeModeId"], "default", snapshot)
-        if paseo_patch:
-            self.assertNotIn("auto", snapshot["availableModes"], snapshot)
         requests = []
         while not upstream.requests.empty():
             requests.append(upstream.requests.get_nowait()[1])
         self.assertTrue(requests)
         self.assertFalse([req for req in requests if "<transcript>" in json.dumps(req.get("input", []))],
                          "No auto-mode classifier request may reach the gateway")
-
-    def assert_live_usage(self, client_module, env, agent_id, used, gate):
-        deadline = time.monotonic() + 15
-        while True:
-            snapshot = self.fetch_agent(client_module, env, agent_id)
-            self.assertEqual(snapshot["status"], "running", snapshot)
-            usage = snapshot["lastUsage"] or {}
-            actual = (usage.get("contextWindowUsedTokens"), usage.get("contextWindowMaxTokens"))
-            if actual == (used, 1050000) or time.monotonic() >= deadline:
-                break
-            time.sleep(0.1)
-        self.assertEqual(actual, (used, 1050000),
-                         f"First unfinished turn at request {gate}: status={snapshot['status']}; "
-                         f"agent.lastUsage={snapshot['lastUsage']}; expected cache-inclusive current-request "
-                         f"usage {used}/1050000 before any final result")
-
-    def run_live_context_session(self, paseo, client_module, env, base, daemon_profile, upstream):
-        sequence = GatedReadSequence(base)
-        upstream.sequence = sequence
-        try:
-            result = subprocess.run([
-                paseo, "run", "--background", "--provider", "claude-codex",
-                "--model", runtime.model_id("max"), "--cwd", str(base), "--json",
-                "Read the two live-read files in order, then reply with OK.",
-            ], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
-            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-            agent_id = json.loads(result.stdout)["agentId"]
-            # The next upstream request is proof that the preceding Read really
-            # executed. Its response cannot emit message_start/result until we
-            # release the gate, so these are first-turn, not post-turn, samples.
-            for gate, used in ((1, 120500), (2, 180650)):
-                self.assertTrue(sequence.arrived[gate].wait(timeout=45),
-                                f"Request {gate + 1} never reached its gate; "
-                                f"agent={self.fetch_agent(client_module, env, agent_id)}")
-                self.assertFalse(sequence.release[gate].is_set())
-                self.assertEqual(len(sequence.requests), gate + 1)
-                outputs = [item for item in sequence.requests[gate].get("input", [])
-                           if item.get("type") == "function_call_output"]
-                matching = [item for item in outputs if item.get("call_id") == sequence.call_ids[gate - 1]]
-                self.assertTrue(matching, f"Read {gate} has no matching real tool result: {outputs}")
-                self.assertIn(sequence.markers[gate - 1], json.dumps(matching))
-                self.assert_live_usage(client_module, env, agent_id, used, gate + 1)
-                # 180650 must replace 120500, never accumulate across requests.
-                self.assertFalse(sequence.release[gate].is_set())
-                sequence.release[gate].set()
-
-            deadline = time.monotonic() + 30
-            while True:
-                snapshot = self.fetch_agent(client_module, env, agent_id)
-                usage = snapshot["lastUsage"] or {}
-                if snapshot["status"] != "running" or time.monotonic() >= deadline:
-                    break
-                time.sleep(0.1)
-            self.assertEqual(snapshot["status"], "idle", snapshot)
-            self.assertEqual(usage.get("contextWindowUsedTokens"), 210800, snapshot)
-            self.assertEqual(usage.get("contextWindowMaxTokens"), 1050000, snapshot)
-            self.assertEqual(len(sequence.requests), 3, "The first turn should use exactly Read → Read → text")
-            self.assertTrue(sequence.errors.empty(), list(sequence.errors.queue))
-
-            deadline = time.monotonic() + 20
-            while True:
-                transcripts = list((daemon_profile / "projects").rglob("*.jsonl"))
-                text = "\n".join(path.read_text() for path in transcripts)
-                if all(marker in text for marker in (*sequence.markers, sequence.final_text)):
-                    break
-                if time.monotonic() >= deadline:
-                    self.fail("The daemon-profile transcript did not preserve both Read results and final text")
-                time.sleep(0.1)
-            self.assertFalse((base / "config/claude/projects").exists(),
-                             "Paseo transcript leaked into the terminal-only profile")
-            # A fresh daemon must reload the actual transcript, not merely keep
-            # an in-memory timeline that happened to render during execution.
-            restarted = subprocess.run([paseo, "daemon", "restart", "--json"], env=env,
-                                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90)
-            self.assertEqual(restarted.returncode, 0, restarted.stderr + restarted.stdout)
-            restored = self.fetch_agent(client_module, env, agent_id, with_timeline=True)
-            timeline = json.dumps(restored["timeline"])
-            for marker in (*sequence.markers, sequence.final_text):
-                self.assertIn(marker, timeline, "Transcript did not survive the private daemon restart")
-        finally:
-            sequence.close()
-
 
 if __name__ == "__main__":
     unittest.main()

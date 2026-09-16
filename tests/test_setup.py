@@ -19,7 +19,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import claude_codex as runtime
 import install
-import paseo_compat
 
 
 class LauncherTests(unittest.TestCase):
@@ -144,9 +143,9 @@ class InstallTests(unittest.TestCase):
         target.chmod(0o755)
         return target
 
+    UPSTREAM_MODULE = "// Paseo's own Claude provider module; never modified by this installer.\nexport {};\n"
+
     def fake_paseo(self, name, body):
-        if not shutil.which("node"):
-            self.skipTest("Node.js is required to validate the installed usage adapter")
         package = self.base / (name + "-package")
         entry = package / "bin" / "paseo"
         entry.parent.mkdir(parents=True)
@@ -155,12 +154,9 @@ class InstallTests(unittest.TestCase):
         runtime.write_json(package / "package.json", {"name": "@getpaseo/cli", "type": "module"})
         server = package / "node_modules" / "@getpaseo" / "server"
         runtime.write_json(server / "package.json", {"name": "@getpaseo/server", "type": "module"})
-        reader = server / paseo_compat.AGENT_PATH
-        reader.parent.mkdir(parents=True)
-        reader.write_text((ROOT / "tests" / "fixtures" / "paseo_claude_usage.js").read_text())
-        task_source = server / paseo_compat.AGENT_PATH.parent / paseo_compat.TASK_SOURCE_PATH
-        task_source.parent.mkdir(parents=True)
-        shutil.copyfile(ROOT / "tests" / "fixtures" / "subagents" / "live-source.js", task_source)
+        module = server / install.LEGACY_AGENT_PATH
+        module.parent.mkdir(parents=True)
+        module.write_text(self.UPSTREAM_MODULE)
         target = self.base / name
         target.symlink_to(entry)
         return target
@@ -561,20 +557,6 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(binary.stat().st_mode & 0o777, 0o700)
         self.assertFalse((self.base.parent / "escape").exists())
 
-    def test_desktop_app_bundle_is_rejected_with_npm_guidance(self):
-        resources = self.base / "Paseo.app" / "Contents" / "Resources"
-        entry = resources / "bin" / "paseo"
-        entry.parent.mkdir(parents=True)
-        entry.write_text("#!/bin/sh\nexit 0\n")
-        entry.chmod(0o755)
-        (resources / "app.asar").write_bytes(b"")
-        link = self.base / "paseo"
-        link.symlink_to(entry)
-        with self.assertRaisesRegex(runtime.SetupError, "desktop app.*app.asar.*--paseo-bin") as raised:
-            paseo_compat.find_usage_reader(link)
-        self.assertIn("@getpaseo/cli", str(raised.exception))
-        self.assertIn("--skip-paseo", str(raised.exception))
-
     def test_full_staged_install_and_launch_with_sdk_arguments(self):
         claude = self.fake_cli("claude-original", "import json,os,sys\nprint(json.dumps({'args':sys.argv[1:],'model':os.environ.get('ANTHROPIC_MODEL'),'base':os.environ.get('ANTHROPIC_BASE_URL')}))\n")
         paseo = self.fake_paseo("paseo-original", "print('paseo original')\n")
@@ -586,8 +568,7 @@ class InstallTests(unittest.TestCase):
                 "--claude-bin", str(claude), "--paseo-bin", str(paseo), "--proxy-binary", str(proxy),
                 "--peppy-config-dir", str(self.base / "claude-peppy"),
                 "--skip-login", "--skip-paseo-start", "--no-path"]
-        reader = paseo_compat.find_usage_reader(paseo)
-        original_reader = reader.read_text()
+        module = install.legacy_agent_module(paseo)
         subprocess.run(args, check=True, capture_output=True, text=True)
         config_file = Path(self.settings["config_dir"]) / "settings.json"
         first = runtime.read_json(config_file)
@@ -599,8 +580,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(peppy_provider_entry["command"], [str(peppy_launcher)])
         self.assertEqual(peppy_provider_entry["env"], {"CLAUDE_PEPPY_PASEO": "1"})
         # Paseo's own module is left exactly as shipped; the plugin is installed instead.
-        self.assertEqual(reader.read_text(), original_reader)
-        self.assertFalse(list(reader.parent.glob("agent.js.claude-codex-backup-*")))
+        self.assertEqual(module.read_text(), self.UPSTREAM_MODULE)
+        self.assertFalse(list(module.parent.glob("agent.js.claude-codex-backup-*")))
         paseo_settings = runtime.read_json(self.base / "paseo" / "config.json")
         plugin_dir = Path(self.settings["data_dir"]) / "paseo-plugin"
         self.assertIs(paseo_settings["pluginsEnabled"], True)
@@ -619,23 +600,20 @@ class InstallTests(unittest.TestCase):
         runtime.write_json(paseo_config, providers)
         subprocess.run(args, check=True, capture_output=True, text=True)
         self.assertEqual(first, runtime.read_json(config_file))
-        self.assertEqual(reader.read_text(), original_reader)
-        self.assertFalse(list(reader.parent.glob("agent.js.claude-codex-backup-*")))
+        self.assertEqual(module.read_text(), self.UPSTREAM_MODULE)
+        self.assertFalse(list(module.parent.glob("agent.js.claude-codex-backup-*")))
         self.assertFalse((plugin_dir / "stale.server.ts").exists())
         self.assertEqual(installed_runtime.read_bytes(), (ROOT / "scripts" / "claude_codex.py").read_bytes())
         self.assertEqual(runtime.read_json(auth)["refresh_token"], "dummy-preserve-only")
         self.assertEqual(runtime.read_json(paseo_config), providers)
-        # The legacy source patch is opt-in, and a default run removes it again
-        # from its recovered upstream source, keeping a backup each time.
-        subprocess.run([*args, "--paseo-patch"], check=True, capture_output=True, text=True)
-        patched_reader = reader.read_text()
-        self.assertEqual(patched_reader, paseo_compat.patch_source(original_reader))
-        backups = sorted(reader.parent.glob("agent.js.claude-codex-backup-*"))
-        self.assertEqual([backup.read_text() for backup in backups], [original_reader])
-        subprocess.run(args, check=True, capture_output=True, text=True)
-        self.assertEqual(reader.read_text(), original_reader)
-        backups = sorted(reader.parent.glob("agent.js.claude-codex-backup-*"))
-        self.assertEqual([backup.read_text() for backup in backups], [original_reader, patched_reader])
+        # A module still carrying an earlier installer's patch is reported, never touched.
+        legacy = self.UPSTREAM_MODULE + install.LEGACY_PATCH_MARKER + " (begin)\n"
+        module.write_text(legacy)
+        result = subprocess.run(args, check=True, capture_output=True, text=True)
+        self.assertIn("still carries the source patch", result.stderr)
+        self.assertIn("npm install -g @getpaseo/cli", result.stderr)
+        self.assertEqual(module.read_text(), legacy)
+        self.assertFalse(list(module.parent.glob("agent.js.claude-codex-backup-*")))
         self.assertEqual(runtime.read_json(paseo_config), providers)
         self.assertEqual(claude.read_bytes(), claude_before)
         self.assertEqual(config_file.stat().st_mode & 0o777, 0o600)
@@ -660,28 +638,25 @@ class InstallTests(unittest.TestCase):
             runtime.launch(first, ["--model", "gpt-6-astra(xhigh)", "-p"])
         self.assertEqual(execute.call_args.args[1], [str(claude), "--model", "gpt-6-astra(xhigh)", "-p"])
 
-    def test_unsupported_paseo_reader_fails_before_installation_changes(self):
+    def test_paseo_module_content_is_never_a_concern(self):
         paseo = self.fake_paseo("paseo-original", "print('original Paseo')\n")
-        reader = paseo_compat.find_usage_reader(paseo)
-        reader.write_text("// unfamiliar upstream implementation\nexport {};\n")
-        original = reader.read_bytes()
-        args = self.staged_args("--paseo-bin", str(paseo))
-        with patch.object(install.Runtime, "stop") as stop, \
-             patch.object(install, "atomic_write") as write, \
-             patch.object(install, "write_json") as write_json:
-            with self.assertRaisesRegex(runtime.SetupError, "Unsupported Paseo"):
-                install.install(install.parser().parse_args([*args, "--paseo-patch"]))
-        stop.assert_not_called()
-        write.assert_not_called()
-        write_json.assert_not_called()
-        self.assertEqual(reader.read_bytes(), original)
-        self.assertFalse(list(reader.parent.glob("agent.js.claude-codex-backup-*")))
-        self.assertFalse((self.base / "paseo-home" / "config.json").exists())
-        # Without the opt-in patch, Paseo's module is never a compatibility concern.
-        install.install(install.parser().parse_args(args))
-        self.assertEqual(reader.read_bytes(), original)
-        self.assertFalse(list(reader.parent.glob("agent.js.claude-codex-backup-*")))
+        module = install.legacy_agent_module(paseo)
+        module.write_text("// unfamiliar upstream implementation\nexport {};\n")
+        original = module.read_bytes()
+        with patch.object(install, "say") as say:
+            install.install(install.parser().parse_args(self.staged_args("--paseo-bin", str(paseo))))
+        self.assertEqual(module.read_bytes(), original)
+        self.assertFalse(list(module.parent.glob("agent.js.claude-codex-backup-*")))
+        self.assertFalse(any("source patch" in call.args[0] for call in say.call_args_list))
         self.assertIn("claude-codex", runtime.read_json(self.base / "paseo-home" / "config.json")["plugins"])
+        # Packages whose module cannot be located, such as the desktop bundle, are skipped.
+        self.assertIsNone(install.legacy_agent_module(self.base / "missing-paseo"))
+        bundle = self.fake_desktop_bundle() / "paseo"
+        self.assertIsNone(install.legacy_agent_module(bundle))
+        self.assertFalse(install.warn_legacy_patch(bundle))
+        module.unlink()
+        self.assertIsNone(install.legacy_agent_module(paseo))
+        self.assertFalse(install.warn_legacy_patch(paseo))
 
     def test_absent_paseo_is_skipped_without_npm_or_config_changes(self):
         claude = self.fake_cli("claude-original", "print('Claude Code')\n")
@@ -715,7 +690,7 @@ class InstallTests(unittest.TestCase):
         install.install(install.parser().parse_args(args + ["--paseo-bin", str(private_paseo), "--skip-paseo-start"]))
         test_path = str(self.base) + os.pathsep + os.environ.get("PATH", "")
         def check_activation(command, **kwargs):
-            self.assertNotIn(paseo_compat.PATCH_MARKER, paseo_compat.find_usage_reader(system_paseo).read_text())
+            self.assertEqual(install.legacy_agent_module(system_paseo).read_text(), self.UPSTREAM_MODULE)
             self.assertTrue((Path(self.settings["data_dir"]) / "paseo-plugin" / "index.server.ts").is_file())
             return subprocess.CompletedProcess(command, 0)
         with patch.dict(os.environ, {"PATH": test_path}), \
@@ -984,48 +959,10 @@ class InstallTests(unittest.TestCase):
             self.assertNotIn("PLANE_API_KEY", kwargs.get("env", {}))
             return subprocess.CompletedProcess(command, 0)
         with patch.dict(os.environ, {"PLANE_API_KEY": "not-for-daemon"}), \
-             patch.object(paseo_compat, "check_syntax"), \
              patch.object(install.subprocess, "run", side_effect=run) as spawn:
             install.install(opts)
         self.assertEqual([call.args[0] for call in spawn.call_args_list],
                          [[str(paseo), "daemon", "restart"], [str(paseo), "reload"]])
-
-    def test_legacy_patch_is_removed_by_default_and_applied_on_request(self):
-        paseo = self.fake_paseo("paseo", "print('paseo')\n")
-        reader = paseo_compat.find_usage_reader(paseo)
-        original = reader.read_text()
-        args = self.staged_args("--paseo-bin", str(paseo))
-
-        def applied(edits):
-            source = original
-            for upstream, patched in edits:
-                source = source.replace(upstream, patched, 1)
-            return source
-
-        layouts = [paseo_compat.replacements(), *paseo_compat.superseded_layouts()]
-        for index, edits in enumerate(layouts):
-            with self.subTest(layout=index):
-                reader.write_text(applied(edits))
-                install.install(install.parser().parse_args(args))
-                self.assertEqual(reader.read_text(), original)
-                backups = sorted(reader.parent.glob("agent.js.claude-codex-backup-*"))
-                self.assertEqual(len(backups), index + 1)
-                self.assertEqual(backups[-1].read_text(), applied(edits))
-        # A marker without a recognized layout is never guessed at; nothing is written.
-        foreign = original + "\n" + paseo_compat.PATCH_MARKER + " (locally edited)\n"
-        reader.write_text(foreign)
-        paseo_config = self.base / "paseo-home" / "config.json"
-        before = paseo_config.read_bytes()
-        with patch.object(install.Runtime, "stop") as stop:
-            with self.assertRaisesRegex(runtime.SetupError, "incomplete or modified"):
-                install.install(install.parser().parse_args(args))
-        stop.assert_not_called()
-        self.assertEqual(reader.read_text(), foreign)
-        self.assertEqual(paseo_config.read_bytes(), before)
-        self.assertEqual(len(list(reader.parent.glob("agent.js.claude-codex-backup-*"))), len(layouts))
-        reader.write_text(original)
-        install.install(install.parser().parse_args([*args, "--paseo-patch"]))
-        self.assertEqual(reader.read_text(), paseo_compat.patch_source(original))
 
     def test_peppy_token_precedence_validation_and_prompt(self):
         opts = install.parser().parse_args(self.staged_args("--skip-paseo"))

@@ -18,7 +18,6 @@ import tempfile
 import termios
 import time
 
-import paseo_compat
 import plane_mcp
 from claude_codex import (
     CONTEXT_WINDOW, EFFORTS, REASONING_MODES, ULTRACODE_MODEL, MARKER, MODEL, PASEO_MARKER, PEPPY_PASEO_MARKER,
@@ -31,6 +30,11 @@ PROXY_VERSION = "7.2.155"
 PLUGIN_ID = "claude-codex"
 PLUGIN_SOURCE = Path(__file__).with_name("paseo_plugin")
 PLUGIN_FILES = ("paseo-plugin.json", "index.server.ts", "package.json")
+# Earlier versions of this installer patched this module inside the selected
+# Paseo package. That is no longer done or undone here; a module still carrying
+# the marker is only reported.
+LEGACY_AGENT_PATH = Path("dist/server/server/agent/providers/claude/agent.js")
+LEGACY_PATCH_MARKER = "// Managed by claude-codex: live context usage"
 CLAUDE_VERSION = "2.1.246"
 # Published release checksums, pinned along with the default version.
 CHECKSUMS = {
@@ -161,6 +165,49 @@ def resolve_cli(name, explicit, package, data_dir, previous=None):
     return executable(prefix / "node_modules" / ".bin" / name, name)
 
 
+def desktop_bundle_root(entry):
+    # Paseo's desktop app ships its CLI shim next to an Electron app.asar.
+    for directory in entry.parents:
+        if (directory / "app.asar").is_file():
+            return directory
+    return None
+
+
+def legacy_agent_module(paseo_bin):
+    """The Claude provider module of an npm-installed Paseo package, if locatable."""
+    entry = Path(paseo_bin).resolve()
+    if desktop_bundle_root(entry) is not None:
+        return None
+    for directory in entry.parents:
+        manifest = directory / "package.json"
+        try:
+            if manifest.is_file() and read_json(manifest).get("name") == "@getpaseo/cli":
+                for root in (directory, *directory.parents):
+                    package = root / "node_modules" / "@getpaseo" / "server"
+                    if package.exists():
+                        module = package / LEGACY_AGENT_PATH
+                        return module if module.is_file() else None
+                return None
+        except SetupError:
+            return None
+    return None
+
+
+def warn_legacy_patch(paseo_bin):
+    """Report a module still carrying the patch of an earlier installer version."""
+    module = legacy_agent_module(paseo_bin)
+    try:
+        patched = module is not None and LEGACY_PATCH_MARKER in module.read_text()
+    except (OSError, UnicodeError):
+        patched = False
+    if patched:
+        say(f"Paseo's Claude provider module still carries the source patch of an earlier version of this "
+            f"installer: {module}. This installer no longer modifies or restores Paseo's files; reinstall "
+            "Paseo at the same version (for example npm install -g @getpaseo/cli@$(paseo --version)) or "
+            "restore the oldest agent.js.claude-codex-backup-* beside it, then restart the daemon.")
+    return patched
+
+
 def detect_paseo(explicit, previous=None, data_dir=None):
     # Paseo is managed by the user. Never install it or select a cached version
     # from an earlier claude-codex installation over the user's PATH.
@@ -168,7 +215,7 @@ def detect_paseo(explicit, previous=None, data_dir=None):
         return executable(explicit, "paseo")
     found = shutil.which("paseo")
     found = str(Path(found).absolute()) if found else None
-    if found and paseo_compat.desktop_bundle_root(Path(found).resolve()) is None:
+    if found and desktop_bundle_root(Path(found).resolve()) is None:
         return found
     # PATH offers only the desktop app bundle, whose packed server module cannot
     # be patched, or nothing at all. Reuse the executable selected last time as
@@ -177,7 +224,7 @@ def detect_paseo(explicit, previous=None, data_dir=None):
     if previous and os.access(previous, os.X_OK) and not Path(previous).is_dir():
         legacy_prefix = (Path(data_dir) / "npm").resolve() if data_dir else None
         resolved = Path(previous).resolve()
-        if paseo_compat.desktop_bundle_root(resolved) is None and (
+        if desktop_bundle_root(resolved) is None and (
                 legacy_prefix is None or legacy_prefix not in resolved.parents):
             if found:
                 say(f"Paseo on PATH is the desktop app bundle {found}; reusing previously selected {previous}")
@@ -518,9 +565,6 @@ def parser():
     p.add_argument("--skip-smoke-test", action="store_true", help="Skip the small live Astra verification request")
     p.add_argument("--skip-paseo", action="store_true", help="Install terminal integration only")
     p.add_argument("--skip-paseo-start", action="store_true", help="Write Paseo configuration without restarting its daemon")
-    p.add_argument("--paseo-patch", action="store_true",
-                   help="Also apply the legacy source patch to Paseo's Claude provider module (version-specific; "
-                        "off by default, and an earlier patch is removed without it)")
     p.add_argument("--no-path", action="store_true", help="Do not edit shell startup files")
     return p
 
@@ -601,7 +645,6 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     # Validate before downloads, stopping services, or replacing configuration.
     plane_key = prepare_plane(opts, previous, config_dir, data_dir, plane_environment_key)
     peppy_token = prepare_peppy_token(opts, previous, peppy_environment_token) if use_peppy else None
-    paseo_patch = paseo_compat.prepare_patch(detected_paseo) if use_paseo and opts.paseo_patch else None
     if use_paseo and use_peppy and not peppy_token:
         say("No token for the second account's Paseo sessions yet; the Claude Peppy provider will refuse to "
             "start sessions until one is saved (claude-peppy setup-token, then rerun ./install.sh).")
@@ -632,10 +675,8 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
         settings["peppy_config_dir"] = previous["peppy_config_dir"]
         if previous.get("peppy_oauth_token"):
             settings["peppy_oauth_token"] = previous["peppy_oauth_token"]
-    if paseo_patch is not None:
-        paseo_compat.apply_patch(paseo_patch, backup)
-    elif use_paseo:
-        paseo_compat.restore_upstream(paseo_bin, backup)
+    if use_paseo:
+        warn_legacy_patch(paseo_bin)
     # Stop only the previously managed process, using its old binary and port.
     if previous:
         Runtime(previous).stop()
