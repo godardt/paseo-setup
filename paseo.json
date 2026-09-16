@@ -1,0 +1,5 @@
+{
+  "worktree": {
+    "setup": "paseo-codex-worktree-setup"
+  }
+}

@@ -24,7 +24,8 @@ The installer is a Python standard-library script. It never modifies your `claud
 - **`claude-codex-proxy`** — proxy start/stop, ChatGPT login, diagnostics, default reasoning.
 - **`claude-peppy`** — a second, regular Claude Code account in `~/.claude-peppy`. No proxy.
 - **`paseo-codex`** (Paseo only) — your Paseo executable with the configured `PASEO_HOME`.
-- **Paseo plugin** `claude-codex` (Paseo 0.8+) — keeps Claude Codex agents out of auto mode via the `agent.create` hook.
+- **`paseo-codex-worktree-setup`** (Paseo only) — worktree setup command for `paseo.json`: new worktrees start from the latest default branch on `origin`.
+- **Paseo plugin** `claude-codex` (Paseo 0.8+) — adds the Plane connector to every Claude Code agent and keeps Claude Codex agents out of auto mode via the `agent.create` hook.
 
 ## Requirements
 
@@ -47,7 +48,7 @@ Prompts, in order (Enter to accept, `skip` to skip):
 3. ChatGPT sign-in for Claude Codex (later: `claude-codex-proxy login`).
 4. Second-account sign-in for Paseo sessions (later: rerun `install.sh`).
 
-The installer downloads CLIProxyAPI 7.2.155 (checksum verified), installs the launchers into `~/.local/bin`, adds it to your shell PATH, sends one small live request to verify Astra access, and, when Paseo is present, merges the providers and plugin into `$PASEO_HOME/config.json` (backup kept), opens the daemon to the LAN, and restarts it. Finish active Paseo sessions first.
+The installer downloads CLIProxyAPI 7.2.155 (checksum verified), installs the launchers into `~/.local/bin`, adds it to your shell PATH, sends one small live request to verify Astra access, and, when Paseo is present, merges the providers, plugin, and pull request policy into `$PASEO_HOME/config.json` (backup kept), opens the daemon to the LAN, and restarts it with the launchers on its PATH. Finish active Paseo sessions first.
 
 Rerun `install.sh` after pulling updates. Tokens, OAuth credentials, and settings are preserved. Upgrading Paseo needs no rerun.
 
@@ -67,6 +68,7 @@ bash install.sh --peppy-oauth-token-file FILE   # or CLAUDE_PEPPY_OAUTH_TOKEN=..
 bash install.sh --plane-api-key-file FILE       # or PLANE_API_KEY=...
 bash install.sh --skip-plane                    # Keeps an existing connection
 bash install.sh --paseo-listen HOST[:PORT]      # Daemon address; `keep` leaves it alone
+bash install.sh --skip-pull-requests            # Leave daemon.appendSystemPrompt alone
 bash install.sh --skip-codex-login --skip-smoke-test --skip-paseo-start --no-path
 bash install.sh --proxy-version X.Y.Z | --proxy-binary /path
 bash install.sh --bin-dir --config-dir --data-dir --state-dir
@@ -110,7 +112,19 @@ Providers added to `config.json`:
 
 Both run in the **daemon's Claude profile** (its `CLAUDE_CONFIG_DIR` or `~/.claude`), because Paseo reloads transcripts from there. Conversations survive restarts; the daemon profile's settings, hooks, and plugins apply.
 
-The plugin rewrites an explicit Auto-mode request for the Claude Codex provider to Always Ask. To keep auto mode, add `"CLAUDE_CODEX_AUTO_MODE": "1"` to the provider's `env` and run `paseo-codex plugin disable claude-codex`.
+The plugin adds the Plane connector (below) to every agent of the `claude`, `claude-codex`, and `claude-peppy` providers, and rewrites an explicit Auto-mode request for the Claude Codex provider to Always Ask. To keep auto mode, add `"CLAUDE_CODEX_AUTO_MODE": "1"` to the provider's `env` and run `paseo-codex plugin disable claude-codex`.
+
+### Worktrees and pull requests
+
+Paseo cuts a new worktree from your **local** default branch, which is only as current as your last pull. The installer provides a [`paseo.json`](https://paseo.sh/docs/worktrees) worktree setup command that fetches `origin` right after the worktree is created and moves the fresh branch onto `origin`'s copy of its base branch (the default branch unless another base was chosen). Register it once per repository and commit the file on the default branch:
+
+```bash
+paseo-codex-worktree-setup init /path/to/repo   # writes {"worktree": {"setup": "paseo-codex-worktree-setup"}}
+```
+
+A checked-out existing branch is fast-forwarded to its `origin` counterpart; a branch with its own commits, a diverged branch, or a pull request checkout is left alone. A failed fetch fails the setup, so the worktree is never silently stale. The daemon must have `~/.local/bin` on its PATH; the installer restarts it that way.
+
+The installer also appends a **pull request policy** to `daemon.appendSystemPrompt` in Paseo's `config.json`, between `[claude-codex pull-request policy]` markers so reruns update it and your own text around it stays. Agents on a worktree or non-default branch finish a completed task by committing, pushing, and opening a pull request against the default branch with `gh pr create`, reporting its URL, unless one already exists or you asked otherwise. Requires an authenticated `gh` on the daemon host. `--skip-pull-requests` leaves the prompt alone.
 
 **Network:** a loopback listener is switched to `0.0.0.0:<port>` so phones and other machines can connect. No password is set; use `paseo-codex daemon set-password` on untrusted networks. Unix-socket or non-loopback listeners are left alone.
 
@@ -129,7 +143,9 @@ Install on each daemon host. If an earlier version of this installer patched Pas
 
 Create a token at [Plane's API tokens page](https://app.plane.so/settings/profile/api-tokens). The installer stores it in a `0600` file and registers a GET-only MCP server, `claude-codex-plane-peppy-readonly`, exposing `list_projects`, `list_work_items`, and `get_work_item` for the `peppy` workspace. Mutations, redirects, and arbitrary paths are rejected in code. The token itself is not read-only; use a least-privilege account.
 
-Test it: ask an agent to "list the projects in peppy". Pass `--strict-mcp-config` to suppress injection.
+Terminal `claude-codex` and `claude-peppy` sessions receive it through `--mcp-config`. Paseo agents receive it from the plugin, which adds the server to every new agent of the `claude`, `claude-codex`, and `claude-peppy` providers (Paseo's built-in provider never runs the launchers). Agents created before the plugin was installed keep their old server list; start a new agent.
+
+Test it: ask an agent to "list the projects in peppy". Pass `--strict-mcp-config` to suppress injection in the terminal.
 
 ## Diagnostics
 
@@ -171,8 +187,8 @@ Not supported through the gateway: Claude's server-side `WebSearch` and auto mod
 ## Remove
 
 1. `claude-codex-proxy stop`; `claude-codex-proxy paths` to list locations.
-2. Paseo: `paseo-codex plugin remove claude-codex`, delete `agents.providers.claude-codex` and `claude-peppy` from `config.json`, reload.
-3. Delete the four launchers from `~/.local/bin` and the installer-marked PATH block in your shell files.
+2. Paseo: `paseo-codex plugin remove claude-codex`, delete `agents.providers.claude-codex` and `claude-peppy` and the `[claude-codex pull-request policy]` block of `daemon.appendSystemPrompt` from `config.json`, reload. Remove `paseo-codex-worktree-setup` from any `paseo.json` you registered it in.
+3. Delete the five launchers from `~/.local/bin` and the installer-marked PATH block in your shell files.
 4. Delete the config, data, and state directories, and `~/.claude-peppy` if unneeded.
 
 ## Development

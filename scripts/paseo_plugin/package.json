@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "version": "0.0.0",
-  "description": "Paseo plugin installed by claude-codex: keeps Claude Codex agents out of the unavailable auto mode",
+  "description": "Paseo plugin installed by claude-codex: adds the read-only Plane connector to Claude Code agents and keeps Claude Codex agents out of the unavailable auto mode",
   "devDependencies": {
     "@getpaseo/plugin": ">=0.8.0",
     "typescript": "^5.9.3"

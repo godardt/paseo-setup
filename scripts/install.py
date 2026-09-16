@@ -26,7 +26,8 @@ import time
 import plane_mcp
 from claude_codex import (
     CONTEXT_WINDOW, EFFORTS, REASONING_MODES, ULTRACODE_MODEL, MARKER, MODEL, PASEO_MARKER, PEPPY_PASEO_MARKER,
-    Runtime, SetupError, atomic_write, model_id, file_lock, peppy_env, proxy_config, read_json, write_json,
+    WORKTREE_SETUP_COMMAND, Runtime, SetupError, atomic_write, model_id, file_lock, peppy_env, proxy_config,
+    read_json, write_json,
 )
 from claude_codex import say as emit
 
@@ -57,8 +58,42 @@ PROXY_VERSION = "7.2.155"
 # The Paseo plugin shipped in this repository; installed as a directory plugin
 # from a private copy so the checkout can move or be removed afterwards.
 PLUGIN_ID = "claude-codex"
+# Appended to every Paseo agent's system prompt (daemon.appendSystemPrompt)
+# between these marker lines, so a rerun updates the policy without touching
+# text the user added around it.
+PR_POLICY_START = "[claude-codex pull-request policy]"
+PR_POLICY_END = "[/claude-codex pull-request policy]"
+PR_POLICY = f"""{PR_POLICY_START}
+Pull requests: when the task is finished and applicable, open a pull request before you stop. Applicable means \
+the workspace is a git worktree or is on a branch other than the repository's default branch (the target of \
+refs/remotes/origin/HEAD), the work is complete and produced changes, no pull request exists for the branch \
+yet (check with `gh pr view`), and the user did not ask for a different workflow. To do so: commit the finished \
+work with a clear message, push the branch to origin, create the pull request against the default branch with \
+`gh pr create` (title, summary of the change, how it was tested), and report its URL. If a pull request already \
+exists for the branch, push to it instead. Otherwise say briefly why no pull request was opened. Never push to \
+the default branch. A Paseo worktree already starts from the latest default branch on origin; do not rebase or \
+reset it unless asked.
+{PR_POLICY_END}"""
+
+
+def pull_request_policy(existing):
+    """The system prompt text with the current policy block, keeping other text."""
+    text = existing if isinstance(existing, str) else ""
+    start, end = text.find(PR_POLICY_START), text.find(PR_POLICY_END)
+    if start != -1 and end > start:
+        before = text[:start].rstrip()
+        after = text[end + len(PR_POLICY_END):].lstrip()
+        parts = [part for part in (before, PR_POLICY, after) if part]
+        return "\n\n".join(parts)
+    text = text.strip()
+    return f"{text}\n\n{PR_POLICY}" if text else PR_POLICY
+
+
 PLUGIN_SOURCE = Path(__file__).with_name("paseo_plugin")
 PLUGIN_FILES = ("paseo-plugin.json", "index.server.ts", "package.json")
+# Generated from the installed Plane MCP configuration rather than copied, so
+# the plugin can add the connector to every Claude Code agent Paseo creates.
+PLUGIN_CONNECTOR_FILE = "server/plane-connector.ts"
 # Earlier versions of this installer patched this module inside the selected
 # Paseo package. That is no longer done or undone here; a module still carrying
 # the marker is only reported.
@@ -361,14 +396,58 @@ def plugin_entry(data_dir):
     return {"source": "directory", "path": str(Path(data_dir) / "paseo-plugin"), "enabled": True}
 
 
-def install_plugin_files(data_dir):
-    """Copy the repository's Paseo plugin into the data directory."""
+def plane_connector_module(plane_mcp_config):
+    """TypeScript source declaring the installed Plane MCP servers for the plugin.
+
+    Paseo evaluates the compiled plugin from memory, so the definition is
+    embedded at install time instead of being read from disk by the plugin.
+    Without a configured connection the module exports no servers and the
+    plugin leaves agents' MCP servers alone.
+    """
+    servers = {}
+    if plane_mcp_config:
+        servers = read_json(plane_mcp_config).get("mcpServers")
+        if not isinstance(servers, dict) or any(
+                not isinstance(server, dict) or server.get("type") != "stdio"
+                or not isinstance(server.get("command"), str)
+                or not isinstance(server.get("args"), list)
+                or any(not isinstance(arg, str) for arg in server["args"])
+                for server in servers.values()):
+            raise SetupError(f"Plane MCP configuration {plane_mcp_config} must define stdio servers with command and args")
+        servers = {name: {"type": "stdio", "command": server["command"], "args": server["args"]}
+                   for name, server in servers.items()}
+    # JSON is a TypeScript object literal; ensure_ascii keeps the file 7-bit
+    # clean regardless of the path characters in the installation directories.
+    literal = json.dumps(servers, indent=2, ensure_ascii=True, sort_keys=True)
+    return (
+        "// Plane connector definition for Paseo agents. The installer regenerates this\n"
+        "// module from the installed plane-mcp.json; the repository copy is the empty\n"
+        "// default used when no Plane connection is configured. Do not edit by hand.\n"
+        f"export const PLANE_MCP_SERVERS: Readonly<Record<string, PlaneMcpServer>> = {literal};\n"
+        "\n"
+        "export interface PlaneMcpServer {\n"
+        "  type: \"stdio\";\n"
+        "  command: string;\n"
+        "  args: string[];\n"
+        "}\n"
+    )
+
+
+def install_plugin_files(data_dir, plane_mcp_config=None):
+    """Copy the repository's Paseo plugin into the data directory.
+
+    The connector module is generated from the installed Plane configuration
+    (empty when Plane is not configured) so the plugin can add the read-only
+    connector to every Claude Code agent Paseo creates.
+    """
     target = Path(data_dir) / "paseo-plugin"
     target.mkdir(parents=True, exist_ok=True)
     for name in PLUGIN_FILES:
         atomic_write(target / name, (PLUGIN_SOURCE / name).read_text(), mode=0o644)
-    for stale in target.iterdir():
-        if stale.name not in PLUGIN_FILES and stale.is_file():
+    atomic_write(target / PLUGIN_CONNECTOR_FILE, plane_connector_module(plane_mcp_config), mode=0o644)
+    managed = {target / name for name in (*PLUGIN_FILES, PLUGIN_CONNECTOR_FILE)}
+    for stale in (*target.iterdir(), *(target / "server").iterdir()):
+        if stale not in managed and stale.is_file():
             stale.unlink()
     return target
 
@@ -410,7 +489,7 @@ def plugin_conflict(config, path, settings, previous):
                      "remove it (paseo plugin remove claude-codex) before installing")
 
 
-def merge_paseo(path, settings, previous, include_peppy):
+def merge_paseo(path, settings, previous, include_peppy, pull_requests=True):
     config = load_paseo(path)
     providers = config["agents"]["providers"]
     updates = provider_updates(settings, include_peppy)
@@ -424,8 +503,17 @@ def merge_paseo(path, settings, previous, include_peppy):
     if isinstance(existing, dict) and existing.get("enabled") is False:
         # A deliberate `paseo plugin disable claude-codex` survives reruns.
         entry["enabled"] = False
+    daemon = config.get("daemon")
+    if daemon is None:
+        daemon = {}
+    if not isinstance(daemon, dict):
+        raise SetupError(f"daemon must be an object in {path}")
+    prompt = daemon.get("appendSystemPrompt")
+    if pull_requests:
+        prompt = pull_request_policy(prompt)
     if all(providers.get(name) == updated for name, updated in updates.items()) \
-            and config.get("pluginsEnabled") is True and plugins.get(PLUGIN_ID) == entry:
+            and config.get("pluginsEnabled") is True and plugins.get(PLUGIN_ID) == entry \
+            and daemon.get("appendSystemPrompt") == prompt:
         return
     providers.update(updates)
     if config.get("pluginsEnabled") is not True:
@@ -433,6 +521,9 @@ def merge_paseo(path, settings, previous, include_peppy):
         config["pluginsEnabled"] = True
     plugins[PLUGIN_ID] = entry
     config["plugins"] = plugins
+    if pull_requests:
+        daemon["appendSystemPrompt"] = prompt
+        config["daemon"] = daemon
     backup(path)
     write_json(path, config)
 
@@ -477,6 +568,15 @@ def paseo_listen_update(config, requested):
     if host in LOOPBACK_HOSTS and port == current[1]:
         return None
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def daemon_path(bin_dir, node_dir, current):
+    """PATH for the Paseo daemon: the launchers and Node first, without duplicates."""
+    entries = []
+    for entry in [str(bin_dir), node_dir, *(current or os.defpath).split(os.pathsep)]:
+        if entry and entry not in entries:
+            entries.append(entry)
+    return os.pathsep.join(entries)
 
 
 def configure_paseo_network(paseo_config, opts):
@@ -934,6 +1034,8 @@ def parser():
                              help="When no Paseo is detected, install the latest release without asking "
                                   "(Homebrew cask on macOS, npm install -g elsewhere)")
     p.add_argument("--skip-paseo-start", action="store_true", help="Write Paseo configuration without restarting its daemon")
+    p.add_argument("--skip-pull-requests", action="store_true",
+                   help="Leave Paseo's daemon.appendSystemPrompt alone instead of adding the pull request policy")
     p.add_argument("--paseo-listen", default="0.0.0.0", metavar="HOST[:PORT]",
                    help="Where the Paseo daemon listens when it is still on loopback (default: 0.0.0.0, all interfaces, "
                         "keeping the port). Use 'keep' to leave it unchanged")
@@ -1020,7 +1122,7 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
         peppy_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     bin_dir.mkdir(parents=True, exist_ok=True)
     launcher_names = ["claude-codex", "claude-codex-proxy"] + (["claude-peppy"] if use_peppy else []) \
-        + (["paseo-codex"] if use_paseo else [])
+        + (["paseo-codex", WORKTREE_SETUP_COMMAND] if use_paseo else [])
     for name in launcher_names:
         path = bin_dir / name
         if (path.exists() or path.is_symlink()) and not launcher_is_owned(path):
@@ -1086,10 +1188,13 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     if use_peppy:
         write_launcher(bin_dir / "claude-peppy", [python_bin, runtime_file, "peppy", settings_file])
     if paseo_bin:
-        install_plugin_files(data_dir)
-        merge_paseo(paseo_config, settings, previous, use_peppy)
+        install_plugin_files(data_dir, settings.get("plane_mcp_config"))
+        merge_paseo(paseo_config, settings, previous, use_peppy, pull_requests=not opts.skip_pull_requests)
         paseo_env = {"PASEO_HOME": str(paseo_home)}
         write_launcher(bin_dir / "paseo-codex", [paseo_bin], paseo_env, path_prepend=settings["node_dir"])
+        # Run by Paseo from a repository's paseo.json (worktree.setup) right
+        # after it creates a worktree; `init` registers it in a repository.
+        write_launcher(bin_dir / WORKTREE_SETUP_COMMAND, [python_bin, runtime_file, "worktree-setup", settings_file])
     if not opts.no_path:
         add_path(bin_dir)
     runtime = Runtime(settings)
@@ -1122,6 +1227,10 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
         env["PASEO_HOME"] = str(paseo_home)
         # Explicitly target this machine; ignore inherited remote daemon selectors.
         env.pop("PASEO_HOST", None)
+        # The daemon inherits this environment and runs paseo.json worktree
+        # commands with it, so the launchers must be on its PATH even when the
+        # shell that ran the installer does not have the bin directory yet.
+        env["PATH"] = daemon_path(bin_dir, settings.get("node_dir"), env.get("PATH"))
         step("Paseo daemon: network access and restart")
         configure_paseo_network(paseo_config, opts)
         if opts.skip_paseo_start:
@@ -1133,6 +1242,9 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
             subprocess.run([paseo_bin, "reload"], env=env, check=True)
     step("Done")
     say(f"Installed: {bin_dir / 'claude-codex'}", "ok")
+    if paseo_bin:
+        say(f"Paseo worktrees: run {bin_dir / WORKTREE_SETUP_COMMAND} init <repo> and commit paseo.json so new "
+            "worktrees start from the latest default branch on origin.")
     say(f"Run: {shlex.quote(str(bin_dir / 'claude-codex'))} --reasoning high")
     if use_peppy:
         say(f"Second account: {bin_dir / 'claude-peppy'} (profile {peppy_dir}); run it once to sign in.")
