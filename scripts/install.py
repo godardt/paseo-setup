@@ -226,8 +226,12 @@ def peppy_provider(settings):
         "enabled": True,
         # The compatibility patch makes the daemon read this profile for an
         # agent's transcripts, importable sessions, and settings-discovered
-        # models; Claude itself always runs in it.
-        "env": {"CLAUDE_CONFIG_DIR": settings["peppy_config_dir"]},
+        # models; Claude itself always runs in it. The label prefix relabels
+        # this provider's model options in Paseo's picker, keeping native ids.
+        "env": {
+            "CLAUDE_CONFIG_DIR": settings["peppy_config_dir"],
+            "CLAUDE_CODEX_MODEL_LABEL_PREFIX": "Peppy",
+        },
     }
 
 
@@ -590,7 +594,8 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     if paseo_bin:
         say("In Paseo, select 'Claude Codex · GPT-6 Astra', then select a reasoning variant in the model picker.")
         if use_peppy:
-            say("In Paseo, select 'Claude Peppy' to use the second Claude account.")
+            say("In Paseo, select 'Claude Peppy' to use the second Claude account; "
+                "its model options are labeled with a Peppy prefix.")
     if opts.skip_login:
         say("Installation staged; login and live verification were skipped. Run claude-codex-proxy login when ready.")
 

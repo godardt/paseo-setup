@@ -629,9 +629,13 @@ function claudeProjectDirSync(cwd, { configDir }) {
     const name = String(cwd).replace(/[^a-zA-Z0-9]+/g, "-");
     return path.join(configDir, "projects", name);
 }
-// Reduced model catalog: reports the config dir it was resolved with.
+// Reduced model catalog: reports the config dir it was resolved with. The
+// second entry is already label-prefixed, like a relabeled cached catalog.
 function getClaudeModelsWithSettings(logger, configDir, claudeCodeVersion) {
-    return Promise.resolve([{ id: "native-model", fromConfigDir: configDir ?? null, version: claudeCodeVersion }]);
+    return Promise.resolve([
+        { id: "native-model", label: "Native Model", fromConfigDir: configDir ?? null, version: claudeCodeVersion },
+        { id: "kept-model", label: "Peppy Kept", fromConfigDir: configDir ?? null, version: claudeCodeVersion },
+    ]);
 }
 // Reduced client wrapper: the profile-resolution call sites keep their
 // original spelling; only the scanning and catalog bodies are reduced.

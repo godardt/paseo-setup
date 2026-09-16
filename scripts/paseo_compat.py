@@ -4,7 +4,8 @@ The adapter gives the Claude Codex provider live context usage, subagent
 tracking for forked skills, and a mode catalog without Claude's auto mode.
 It also resolves Claude profiles from a provider entry's own CLAUDE_CONFIG_DIR
 for history replay, importable sessions, and settings-discovered models, so a
-provider such as the installer's second account keeps its own transcripts.
+provider such as the installer's second account keeps its own transcripts,
+and relabels that provider's model options from its own label-prefix marker.
 Paseo's regular Claude provider keeps its original behavior.
 """
 
@@ -79,9 +80,13 @@ PATCHED_LIST_IMPORTABLE = (
     '?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");'
 )
 MODELS_REFRESH = "getClaudeModelsWithSettings(this.logger, this.configDir, claudeCodeVersion)"
-PATCHED_MODELS_REFRESH = ("getClaudeModelsWithSettings(this.logger, "
-                          "claudeCodexProviderConfigDir(this.runtimeSettings?.env) ?? this.configDir, "
-                          "claudeCodeVersion)")
+PATCHED_MODELS_REFRESH_PROFILE = ("getClaudeModelsWithSettings(this.logger, "
+                                  "claudeCodexProviderConfigDir(this.runtimeSettings?.env) ?? this.configDir, "
+                                  "claudeCodeVersion)")
+# The fetched catalog keeps its native model ids and thinking options; a
+# provider entry's label prefix only relabels the models it offers.
+PATCHED_MODELS_REFRESH = (PATCHED_MODELS_REFRESH_PROFILE
+                          + ".then((models) => claudeCodexPrefixedModelLabels(this.runtimeSettings?.env, models))")
 # These are the consumer contracts the adapter relies on, not a package version
 # check. Leave unfamiliar source untouched rather than guessing.
 AGENT_ANCHORS = (
@@ -171,9 +176,30 @@ def prior_replacements():
     )
 
 
+def prefixless_replacements():
+    """The layout written before model-label prefixes, recognized only to upgrade it."""
+    return (
+        (BASE_CLASS, RENAMED_CLASS),
+        (SESSION_CLASS, adapter_source("paseo_usage_prefixless.js") + SESSION_CLASS),
+        (INITIALIZER, PATCHED_INITIALIZER),
+        (TASK_SOURCE_IMPORT, RENAMED_TASK_SOURCE_IMPORT),
+        (TASK_SOURCE_NEW, PATCHED_TASK_SOURCE_NEW),
+        (RESOLVE_SIDECHAIN, PATCHED_RESOLVE_SIDECHAIN),
+        (FINISH_SIDECHAIN, PATCHED_FINISH_SIDECHAIN),
+        (MODE_CATALOG, PATCHED_MODE_CATALOG),
+        (AVAILABLE_MODES, PATCHED_AVAILABLE_MODES),
+        (REPLAY_FACTS, RENAMED_REPLAY_FACTS),
+        (REPLAY_ROOT_CALL, PATCHED_REPLAY_ROOT_CALL),
+        (REPLAY_CHILD_CALL, PATCHED_REPLAY_CHILD_CALL),
+        (RESOLVE_HISTORY, PATCHED_RESOLVE_HISTORY),
+        (LIST_IMPORTABLE, PATCHED_LIST_IMPORTABLE),
+        (MODELS_REFRESH, PATCHED_MODELS_REFRESH_PROFILE),
+    )
+
+
 def superseded_layouts():
     """Older patch layouts, newest first, recognized only to upgrade them."""
-    return (prior_replacements(), previous_replacements())
+    return (prefixless_replacements(), prior_replacements(), previous_replacements())
 
 
 def reverse_edits(source, edits):

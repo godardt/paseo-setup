@@ -147,6 +147,22 @@ class PatchSourceTests(unittest.TestCase):
             with self.assertRaises(claude_codex.SetupError):
                 paseo_compat.patch_source(candidate)
 
+    def test_prefixless_installer_layout_is_upgraded_to_the_current_patch(self):
+        prefixless = self.source
+        for upstream, patched in paseo_compat.prefixless_replacements():
+            self.assertEqual(prefixless.count(upstream), 1, upstream[:60])
+            prefixless = prefixless.replace(upstream, patched, 1)
+        self.assertIn(paseo_compat.PATCH_MARKER, prefixless)
+        self.assertNotIn("claudeCodexPrefixedModelLabels", prefixless)
+        upgraded = paseo_compat.patch_source(prefixless)
+        self.assertEqual(upgraded, paseo_compat.patch_source(self.source))
+        self.assertEqual(paseo_compat.patch_source(upgraded), upgraded)
+        # A locally edited prefixless patch is neither trusted nor upgraded blindly.
+        for candidate in (prefixless.replace("this.codexLateUsage = launchEnv", "this.codexLateUsage = process.env", 1),
+                          prefixless.replace(PATCHED_INITIALIZER, INITIALIZER, 1)):
+            with self.assertRaises(claude_codex.SetupError):
+                paseo_compat.patch_source(candidate)
+
 
 @unittest.skipUnless(NODE, "Node is required to execute the transformed fixture in memory")
 class NodeFixtureTests(unittest.TestCase):
@@ -741,6 +757,29 @@ class ProfileResolutionTests(NodeFixtureTests):
             assert.equal(await client.listImportableSessions({{cwd: '/tmp/project'}}), path.dirname(resolved));
             assert.equal(await client.listImportableSessions(), path.join('/tmp/peppy-profile', 'projects'));
             assert.equal((await client.fetchCatalog())[0].fromConfigDir, '/tmp/peppy-profile');
+        """)
+
+    def test_provider_environment_prefixes_model_labels(self):
+        self.run_js(f"""
+            const providerEnv = {{CLAUDE_CONFIG_DIR: '/tmp/peppy-profile',
+                                  CLAUDE_CODEX_MODEL_LABEL_PREFIX: 'Peppy'}};
+            const client = {self.CLIENT};
+            const models = await client.fetchCatalog();
+            assert.equal(models[0].fromConfigDir, '/tmp/peppy-profile');
+            assert.equal(models[0].label, 'Peppy Native Model');
+            assert.equal(models[0].id, 'native-model', 'Only the label changes, never the id');
+            assert.equal(models[1].label, 'Peppy Kept', 'An already-prefixed label is kept');
+            assert.equal(models[1].id, 'kept-model');
+        """)
+
+    def test_unmarked_or_blank_prefix_keeps_native_model_labels(self):
+        self.run_js(f"""
+            for (const providerEnv of [{{}}, {{CLAUDE_CODEX_MODEL_LABEL_PREFIX: '  '}}]) {{
+                const client = {self.CLIENT};
+                const models = await client.fetchCatalog();
+                assert.equal(models[0].label, 'Native Model');
+                assert.equal(models[1].label, 'Peppy Kept');
+            }}
         """)
 
     def test_launch_environment_overrides_provider_settings_for_history(self):

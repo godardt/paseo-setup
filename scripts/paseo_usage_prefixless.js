@@ -70,27 +70,6 @@ function claudeCodexProviderConfigDir(env) {
     const value = env?.CLAUDE_CONFIG_DIR;
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
-// A provider entry can prefix the labels of the models its catalog offers.
-// Ids, thinking options, and settings-discovered models stay native; only the
-// picker label identifies the account. Already-prefixed labels are kept, so
-// the transform stays idempotent across repeated catalog refreshes.
-function claudeCodexModelLabelPrefix(env) {
-    const value = env?.CLAUDE_CODEX_MODEL_LABEL_PREFIX;
-    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
-}
-function claudeCodexPrefixedModelLabels(env, models) {
-    const prefix = claudeCodexModelLabelPrefix(env);
-    if (prefix === undefined || !Array.isArray(models)) {
-        return models;
-    }
-    return models.map((model) => {
-        const label = model?.label;
-        return typeof label === "string" && label.trim().length > 0
-            && label !== prefix && !label.startsWith(prefix + " ")
-            ? { ...model, label: prefix + " " + label }
-            : model;
-    });
-}
 // Claude's auto mode needs Anthropic's classifier models, which the Codex
 // gateway cannot serve; the launcher therefore disables auto mode in Claude
 // itself. Paseo's mode catalog must not offer or default to a mode that the
