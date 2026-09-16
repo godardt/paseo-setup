@@ -2,7 +2,7 @@
 
 Run the **Claude Code harness with GPT-6 Astra**, using your ChatGPT subscription through CLIProxyAPI's Codex OAuth provider. A separate `claude-codex` command configures the proxy connection and reasoning level. The original `claude` executable and its user configuration stay in place. The same installer also sets up a **second, regular Claude Code account** — `claude-peppy`, profile `~/.claude-peppy` — for terminal use and as a distinguishable Paseo provider.
 
-Optionally adds a separate **Claude Codex · GPT-6 Astra** provider to an existing Paseo installation, together with a small **Paseo plugin** built on Paseo's public plugin API (0.8+). Paseo's own files are not modified, so Paseo upgrades do not break the integration. Paseo is not required for terminal use; the installer uses whichever Paseo executable you have.
+Optionally adds a separate **Claude Codex · GPT-6 Astra** provider to a Paseo installation (existing, or installed on request by the installer), together with a small **Paseo plugin** built on Paseo's public plugin API (0.8+). Paseo's own files are not modified, so Paseo upgrades do not break the integration. Paseo is not required for terminal use; the installer uses whichever Paseo executable you have.
 
 ```text
 Terminal: claude-codex ──────────┐
@@ -30,14 +30,14 @@ From a checkout of this repository, run this on the computer hosting Claude Code
 bash install.sh
 ```
 
-When prompted, enter a Plane personal API token to enable **read-only access to [peppy](https://app.plane.so/peppy/)**, or press Enter to skip. When Paseo is detected, a second prompt asks for the second account's long-lived token from `claude-peppy setup-token` (see "The second account in Paseo"); Enter skips it too. Complete the ChatGPT sign-in when prompted. The script configures the proxy and, when detected, Paseo, including a small live request to verify Astra access. Plane authentication is separate and is checked on the first Plane read, not by that Astra request. If your bin directory was added to `PATH`, open a new terminal after installation or use the absolute command printed by the installer.
+When prompted, enter a Plane personal API token to enable **read-only access to [peppy](https://app.plane.so/peppy/)**, or press Enter to skip. Next, the installer asks whether to sign in with ChatGPT for Claude Codex: press Enter and complete the sign-in, or type `skip` to leave Claude Codex for later (`claude-codex-proxy login`) while the remaining steps run. When Paseo is detected, the installer then offers to sign in with the second account in the browser to generate the long-lived token its Paseo sessions use (see "The second account in Paseo"); press Enter to do so, paste an existing token, or type `skip`. If no Paseo executable is found, the installer first offers to install the latest release (`brew install --cask paseo` on macOS, `npm install -g @getpaseo/cli` elsewhere); type `skip` there for a terminal-only setup. The script configures the proxy and, when detected or installed, Paseo, including a small live request to verify Astra access. Plane authentication is separate and is checked on the first Plane read, not by that Astra request. If your bin directory was added to `PATH`, open a new terminal after installation or use the absolute command printed by the installer.
 
 Requirements:
 
 - Linux (including WSL2) or macOS, on x86_64 or ARM64.
 - Python 3.9+, plus `curl` to download CLIProxyAPI (`curl` is not required with `--proxy-binary`).
 - Existing Claude Code, or Node.js **22+** and npm to install it privately.
-- Paseo is optional: setup runs only when an executable is found on PATH or supplied with `--paseo-bin`. The installer reuses that exact executable and does not manage Paseo releases. Paseo **0.8.0 or later** is required for the plugin (`requirements.paseo` in its manifest); on an older daemon Paseo reports the plugin as incompatible and the providers still work without it. The desktop app's bundled `paseo` command is accepted. Paseo's own files are never modified.
+- Paseo is optional: setup runs when an executable is found on PATH or supplied with `--paseo-bin`. When none is found, an interactive run offers to install the latest release with Paseo's documented command for the platform (`brew install --cask paseo` on macOS, `npm install -g @getpaseo/cli` elsewhere), and `--install-paseo` does so without asking; noninteractive runs without that flag skip Paseo. An npm global install needs a user-writable prefix (for example `npm config set prefix ~/.local`); the installer never uses sudo. An existing Paseo is reused as it is and never upgraded by the installer. Paseo **0.8.0 or later** is required for the plugin (`requirements.paseo` in its manifest); on an older daemon Paseo reports the plugin as incompatible and the providers still work without it. The desktop app's bundled `paseo` command is accepted. Paseo's own files are never modified.
 - A ChatGPT account with subscription-based Codex access **and access to `gpt-6-astra`**.
 
 Model access and usage limits come from the signed-in ChatGPT account, not a proxy setting. A subscription's plan label alone does not establish Astra entitlement. By default, the installer checks an actual request and reports access/quota failures. This integration does not require an OpenAI API key or configure pay-as-you-go API billing.
@@ -45,7 +45,7 @@ Model access and usage limits come from the signed-in ChatGPT account, not a pro
 ### What the installer does
 
 1. Reuses your Claude binary. If missing, installs `@anthropic-ai/claude-code@2.1.246` into a private directory.
-2. Selects the executable supplied with `--paseo-bin`, or the existing `paseo` on PATH. When PATH resolves only to the desktop app bundle, or to nothing, the executable selected by the previous install is reused if it still exists. **If none is available, skips all Paseo configuration and daemon operations.** No Paseo package is downloaded or version enforced; cached private copies from older installer runs are not selected automatically. `paseo-codex` invokes the detected executable.
+2. Selects the executable supplied with `--paseo-bin`, or the existing `paseo` on PATH. When PATH resolves only to the desktop app bundle, or to nothing, the executable selected by the previous install is reused if it still exists. **If none is available, offers to install the latest Paseo (see above) and otherwise skips all Paseo configuration and daemon operations.** An existing Paseo is never replaced or version enforced; cached private copies from older installer runs are not selected automatically. `paseo-codex` invokes the detected executable.
 3. Downloads **CLIProxyAPI 7.2.155** and verifies a pinned SHA-256 checksum. Linux uses the static build without plugin support.
 4. Creates an isolated configuration, OAuth directory, random local API token, and Claude profile with private file permissions.
 5. Installs `claude-codex`, `claude-codex-proxy`, `claude-peppy`, and (when Paseo is detected) `paseo-codex` into `~/.local/bin`, then adds that directory to your shell's startup configuration.
@@ -133,16 +133,16 @@ claude-peppy --resume
 
 When Paseo is detected, the installer also merges a **Claude Peppy** provider (`agents.providers.claude-peppy`) into `$PASEO_HOME/config.json`. It extends Paseo's regular Claude provider — the native model list, auto mode, WebSearch, and normal usage reporting all work — and differs only in the account it signs in with. Select **Claude Peppy** when creating an agent to use the second account; the provider name identifies the account in the picker and on each agent.
 
-Paseo's daemon reloads an agent's transcript from the profile *it* resolves (`CLAUDE_CONFIG_DIR` or `~/.claude`), ignoring the environment of the provider it spawns, and Paseo's plugin API offers no way to change that. Rather than pinning the peppy profile and patching Paseo to read it, the provider runs its Paseo sessions **in the daemon's profile**, exactly like Claude Codex and the regular Claude provider, and selects the account with a **long-lived token** from Claude Code's documented `claude setup-token` flow: the launcher exports it as `CLAUDE_CODE_OAUTH_TOKEN`, which Claude Code ranks above the profile's stored login. Conversations survive daemon restarts and app reloads with no changes to Paseo. Generate the token once and give it to the installer:
+Paseo's daemon reloads an agent's transcript from the profile *it* resolves (`CLAUDE_CONFIG_DIR` or `~/.claude`), ignoring the environment of the provider it spawns, and Paseo's plugin API offers no way to change that. Rather than pinning the peppy profile and patching Paseo to read it, the provider runs its Paseo sessions **in the daemon's profile**, exactly like Claude Codex and the regular Claude provider, and selects the account with a **long-lived token** from Claude Code's documented `claude setup-token` flow: the launcher exports it as `CLAUDE_CODE_OAUTH_TOKEN`, which Claude Code ranks above the profile's stored login. Conversations survive daemon restarts and app reloads with no changes to Paseo. The installer generates the token itself: once the Claude binary and the launcher are in place, an interactive run offers to run the `setup-token` sign-in for the second account on the spot (press Enter, sign in with the second account in the browser, and paste the code if asked), reads the printed token, and saves it. The same prompt accepts a pasted token, or `skip`. Noninteractive runs take the token from a file or the environment:
 
 ```bash
-claude-peppy setup-token        # Sign in with the second account in the browser; copy the printed token
-./install.sh                    # Paste it at the masked prompt (Enter to skip)
+./install.sh                    # Press Enter at the second-account prompt to sign in and save the token
 ./install.sh --peppy-oauth-token-file /secure/path/peppy-token   # Noninteractive, or rotation
 CLAUDE_PEPPY_OAUTH_TOKEN=... ./install.sh                         # From a secret manager
+claude-peppy setup-token        # Generate a token by hand, for the two forms above
 ```
 
-Selection order is **explicit file → environment → saved token → masked prompt**, like the Plane token. The token is stored only in the installer's private `settings.json` (mode `0600`); Paseo's configuration carries just the marker `CLAUDE_PEPPY_PASEO=1`, and the launcher injects the token at launch. The token lasts about a year and requires a Pro, Max, Team, or Enterprise subscription; when it expires, generate a new one and rerun the installer with it. Without a saved token, the provider is still configured, but a Paseo session fails at startup with instructions instead of silently using the daemon's primary login. The terminal `claude-peppy` command is unchanged and never uses the token: it keeps running in its own profile with its own browser login.
+Selection order is **explicit file → environment → saved token → interactive sign-in or paste**, like the Plane token. Ctrl-C cancels the sign-in. A skipped, cancelled, or failed sign-in leaves the rest of the installation complete; rerun `./install.sh` to be offered it again. The token is stored only in the installer's private `settings.json` (mode `0600`); Paseo's configuration carries just the marker `CLAUDE_PEPPY_PASEO=1`, and the launcher injects the token at launch. The token lasts about a year and requires a Pro, Max, Team, or Enterprise subscription; when it expires, pass a new one with `--peppy-oauth-token-file`, or remove `peppy_oauth_token` from the installer's `settings.json` and rerun `./install.sh` to sign in again. Without a saved token, the provider is still configured, but a Paseo session fails at startup with instructions instead of silently using the daemon's primary login. The terminal `claude-peppy` command is unchanged and never uses the token: it keeps running in its own profile with its own browser login.
 
 Consequences of running in the daemon's profile: Paseo sessions of the second account use that profile's user-level settings, hooks, and plugins (as Claude Codex sessions already do), their transcripts and auto-memory live there, and they appear in the regular Claude provider's session-import list. A Claude Peppy agent created by an earlier version of this installer recorded its transcript in the peppy profile; when Paseo resumes it, the launcher moves that transcript into the daemon's profile, and the history shows after the next reload. `--skip-peppy` skips the launcher and provider while preserving existing ones and the saved token.
 
@@ -223,13 +223,16 @@ bash install.sh --claude-bin /path/to/claude --paseo-bin /path/to/paseo
 # Terminal-only installation.
 bash install.sh --skip-paseo
 
+# Install the latest Paseo without asking when none is detected.
+bash install.sh --install-paseo
+
 # Stage files without login, live model requests, Paseo startup, or shell edits.
 bash install.sh --skip-login --skip-paseo-start --no-path
 
 bash install.sh --help
 ```
 
-`--skip-smoke-test` skips the subscription-consuming verification request. `--skip-paseo-start` stages the provider and plugin configuration but leaves daemon activation to you; subsequently run `paseo-codex daemon restart` and `paseo-codex reload`.
+`--skip-codex-login` skips the ChatGPT sign-in and its live verification while still installing everything else, the same as answering `skip` at the prompt; an existing ChatGPT login is verified without asking. `--skip-smoke-test` skips the subscription-consuming verification request. `--skip-paseo-start` stages the provider and plugin configuration but leaves daemon activation to you; subsequently run `paseo-codex daemon restart` and `paseo-codex reload`.
 
 `--proxy-version X.Y.Z` selects another release and verifies its published checksum. `--proxy-binary /path/to/cli-proxy-api` uses an existing trusted binary without downloading or verifying it; use 7.2.155 or a compatible version with Astra and `max` support.
 
@@ -321,7 +324,7 @@ Troubleshooting:
 - **The plugin shows `failed` in `paseo-codex plugin ls`:** read `paseo-codex plugin logs claude-codex`. A daemon older than 0.8.0 reports the version requirement; rerun `./install.sh` after updating this repository if the entry file changed.
 - **A tool call was "denied by the Claude Code auto mode classifier":** the session predates this launcher's auto-mode setting or runs with `CLAUDE_CODEX_AUTO_MODE=1`. Start a new agent, or switch the existing one to another permission mode; see "Permission modes".
 - **Paseo shows an empty conversation for an existing agent:** the transcript is not in the profile the daemon reads. Rerun the installer and reload Paseo; see "Conversation history in Paseo" above. Sending one message to the agent moves an older transcript across (from the isolated Codex profile or the peppy profile), and the history returns after the next reload.
-- **A Claude Peppy agent fails at startup mentioning `claude-peppy setup-token`:** no token is saved for the second account's Paseo sessions, or it expired. Generate one and rerun the installer with it; see "The second account in Paseo".
+- **A Claude Peppy agent fails at startup mentioning `claude-peppy setup-token`:** no token is saved for the second account's Paseo sessions, or it expired. Rerun `./install.sh` and sign in with the second account when offered (remove `peppy_oauth_token` from the installer's `settings.json` first if an expired token is saved), or pass a token with `--peppy-oauth-token-file`; see "The second account in Paseo".
 - **Proxy startup failure:** inspect `~/.local/state/claude-codex/proxy-startup.log` and the `logs/` directory there. Avoid sharing credentials from config files.
 - **Unexpected routing:** inspect project `.claude/settings.json`, `.claude/settings.local.json`, and managed settings for conflicting model/provider environment variables.
 

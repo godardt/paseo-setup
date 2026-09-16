@@ -430,8 +430,8 @@ def peppy_env(settings, source=None):
         token = settings.get("peppy_oauth_token")
         if not token:
             raise SetupError("No long-lived token is saved for the second account's Paseo sessions. "
-                             "Run claude-peppy setup-token, then rerun ./install.sh and paste the token "
-                             "(or pass --peppy-oauth-token-file)")
+                             "Rerun ./install.sh and sign in with the second account when asked, or run "
+                             "claude-peppy setup-token and pass the token with --peppy-oauth-token-file")
         # Provider entries written by older installers pinned the profile.
         pinned = env.get("CLAUDE_CONFIG_DIR")
         if pinned is not None and pinned in (settings.get("peppy_config_dir"), isolated_profile(settings)):

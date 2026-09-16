@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 import socket
 from pathlib import Path
@@ -12,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import textwrap
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -986,28 +988,358 @@ class InstallTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime.SetupError, "Cannot read --peppy-oauth-token-file"):
             install.prepare_peppy_token(opts, {}, None)
         opts.peppy_oauth_token_file = None
-        # Staged and noninteractive runs never prompt; interactive runs prompt masked.
-        with patch.object(install.sys.stdin, "isatty", return_value=True), \
-             patch.object(install, "masked_input", return_value="sk-ant-oat01-typed") as prompt:
-            self.assertIsNone(install.prepare_peppy_token(opts, {}, None))
-            prompt.assert_not_called()
+        # Selection never prompts: the interactive sign-in needs the installed
+        # Claude binary and happens later in the run (acquire_peppy_token).
+        for interactive in (True, False):
             opts.skip_login = False
-            with patch.object(install, "say") as say:
-                self.assertEqual(install.prepare_peppy_token(opts, {}, None), "sk-ant-oat01-typed")
-            prompt.assert_called_once_with(
-                "Second account token from claude setup-token (masked with *; Enter to skip): ")
-            self.assertTrue(any("claude-peppy setup-token" in call.args[0] for call in say.call_args_list))
-            self.assertFalse(any("sk-ant-oat01-typed" in call.args[0] for call in say.call_args_list))
+            with patch.object(install.sys.stdin, "isatty", return_value=interactive), \
+                 patch.object(install, "masked_input") as prompt:
+                self.assertIsNone(install.prepare_peppy_token(opts, {}, None))
+                self.assertIsNone(install.prepare_peppy_token(opts, {"peppy_oauth_token": ""}, None))
+                prompt.assert_not_called()
+
+    def test_acquire_peppy_token_offers_sign_in_paste_and_skip(self):
+        settings = {**self.settings, "claude_bin": "/opt/claude", "peppy_config_dir": str(self.base / "claude-peppy")}
+        with patch.object(install, "masked_input", return_value="") as prompt, \
+             patch.object(install, "sign_in_second_account", return_value="sk-ant-oat01-generated") as sign_in, \
+             patch.object(install, "say") as say:
+            self.assertEqual(install.acquire_peppy_token(settings), "sk-ant-oat01-generated")
+            sign_in.assert_called_once_with(settings)
+            prompt.assert_called_once_with("Second account token (masked with *; Enter to sign in now; type skip to skip): ")
+            self.assertTrue(any("Enter to sign in" in call.args[0] for call in say.call_args_list))
+            self.assertFalse(any("sk-ant-oat01" in call.args[0] for call in say.call_args_list))
+            # A pasted token is used as is; skip saves nothing and does not sign in.
+            sign_in.reset_mock()
+            prompt.return_value = " sk-ant-oat01-pasted \n"
+            self.assertEqual(install.acquire_peppy_token(settings), "sk-ant-oat01-pasted")
+            prompt.return_value = "SKIP"
+            self.assertIsNone(install.acquire_peppy_token(settings))
+            sign_in.assert_not_called()
+            prompt.return_value = "two words"
+            with self.assertRaisesRegex(runtime.SetupError, "single line"):
+                install.acquire_peppy_token(settings)
+            # A failed sign-in leaves the installation usable and prints the fallback.
             prompt.return_value = ""
-            self.assertIsNone(install.prepare_peppy_token(opts, {}, None))
+            sign_in.side_effect = runtime.SetupError("claude setup-token did not print a token")
+            say.reset_mock()
+            self.assertIsNone(install.acquire_peppy_token(settings))
+            messages = [call.args[0] for call in say.call_args_list]
+            self.assertTrue(any("did not print a token" in message for message in messages))
+            self.assertTrue(any("claude-peppy setup-token" in message for message in messages))
             prompt.side_effect = OSError("sensitive terminal details")
             with self.assertRaisesRegex(runtime.SetupError, "masked token") as raised:
-                install.prepare_peppy_token(opts, {}, None)
+                install.acquire_peppy_token(settings)
             self.assertNotIn("sensitive", str(raised.exception))
-        with patch.object(install.sys.stdin, "isatty", return_value=False), \
-             patch.object(install, "masked_input") as prompt:
-            self.assertIsNone(install.prepare_peppy_token(opts, {}, None))
+
+    def test_printed_oauth_tokens_reads_wrapped_and_redrawn_ink_output(self):
+        # Claude Code prints the token as its own paragraph and hard-wraps it at
+        # the terminal width; earlier frames are redrawn with cursor movement.
+        frame = ("\x1b[2K\x1b[1A\x1b[2K\x1b[G  Long-lived authentication token created successfully!\r\n\r\n"
+                 "  Your OAuth token (valid for 1y):\r\n\r\n"
+                 "  \x1b[33msk-ant-oat01-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x1b[39m\r\n"
+                 "  \x1b[33mBBBBBBBBBBBBBBBB_CC-DD\x1b[39m\r\n\r\n"
+                 "  \x1b[2mStore this token securely. You won't be able to see it again.\x1b[22m\r\n\r\n"
+                 "  \x1b[2mUse this token by setting: export CLAUDE_CODE_OAUTH_TOKEN=<token>\x1b[22m\r\n")
+        spinner = "\x1b]0;claude\x07\x1b[?25l  ⠋ Waiting for login...\r\n\x1b[1A\x1b[2K  ⠙ Waiting for login...\r\n"
+        output = (spinner + frame + frame).encode()
+        token = "sk-ant-oat01-" + "A" * 56 + "BBBBBBBBBBBBBBBB_CC-DD"
+        self.assertEqual(install.printed_oauth_tokens(output), {token})
+        # An unwrapped token, a token followed by other text, and no token at all.
+        self.assertEqual(install.printed_oauth_tokens(b"x\r\n\x1b[33msk-ant-oat01-short\x1b[39m\r\n\r\ny"), {"sk-ant-oat01-short"})
+        self.assertEqual(install.printed_oauth_tokens(b"see sk-ant-oat01-short: below\r\n\r\n"), set())
+        self.assertEqual(install.printed_oauth_tokens(b"\r\nsk-ant-oat02-newer_format\r\n\r\n"), {"sk-ant-oat02-newer_format"})
+        self.assertEqual(install.printed_oauth_tokens(b"Browser didn't open? Use the url below\r\n"), set())
+
+    def test_run_on_terminal_relays_input_and_captures_output(self):
+        # Like Claude Code: keys arrive from a terminal, screens go to a pipe.
+        tool = self.fake_cli("interactive-tool", textwrap.dedent("""\
+            import os, signal, sys, termios, tty
+            signal.signal(signal.SIGINT, lambda *_: sys.exit(7))
+            assert sys.stdin.isatty() and not sys.stdout.isatty()
+            assert os.open("/dev/tty", os.O_RDWR) > 2
+            print("Paste code here:", flush=True)
+            tty.setraw(0)
+            code = b""
+            while not code.endswith(b"\\r"):
+                code += os.read(0, 1)
+            code = code.strip().decode()
+            print("Paste code here: " + code, flush=True)
+            print("\\x1b[33msk-ant-oat01-" + code + "\\x1b[39m\\n\\nsize=" + repr(os.get_terminal_size(0)), file=sys.stderr, flush=True)
+            raise SystemExit(3 if code == "fail" else 0)
+        """))
+        for code, expected_status in (("abc-123", 0), ("fail", 3), ("\x03", 7)):
+            with self.subTest(code=code):
+                user_master, user_tty = os.openpty()
+                self.addCleanup(os.close, user_master)
+                shown = []
+
+                def act_as_user():
+                    buffered = b""
+                    while b"Paste code here:" not in buffered:
+                        buffered += os.read(user_master, 4096)
+                    os.write(user_master, (code + "\r").encode())  # Enter, as a raw-mode terminal sends it
+                    while code != "\x03":
+                        try:
+                            chunk = os.read(user_master, 4096)
+                        except OSError:
+                            break
+                        if not chunk:
+                            break
+                        buffered += chunk
+                        if b"size=" in buffered and buffered.rstrip().endswith(b")"):
+                            break
+                    shown.append(buffered)
+
+                user = threading.Thread(target=act_as_user)
+                user.start()
+                status, captured = install.run_on_terminal(
+                    [str(tool)], {"PATH": os.environ.get("PATH", ""), "HOME": str(self.base)},
+                    stdin_fd=user_tty, stdout_fd=user_tty)
+                user.join(timeout=10)
+                self.assertFalse(user.is_alive())
+                # The raw mode used for relaying keystrokes was restored afterwards.
+                self.assertTrue(install.termios.tcgetattr(user_tty)[3] & install.termios.ECHO)
+                os.close(user_tty)
+                self.assertEqual(status, expected_status)
+                self.assertIn(b"Paste code here:", captured)
+                if code == "\x03":
+                    # Raw-mode keys generate no signal; the runner delivers Ctrl-C itself.
+                    self.assertEqual(install.printed_oauth_tokens(captured), set())
+                    continue
+                self.assertEqual(install.printed_oauth_tokens(captured), {"sk-ant-oat01-" + code})
+                self.assertIn(b"size=os.terminal_size(columns=", captured)
+                # The user's terminal saw everything the tool printed, in order.
+                self.assertLess(shown[0].index(b"Paste code here:"), shown[0].index(("sk-ant-oat01-" + code).encode()))
+
+    def test_paseo_install_command_follows_platform(self):
+        def which(available):
+            return lambda name: available.get(name)
+        npm_command = ["/usr/bin/npm", "install", "-g", "@getpaseo/cli@latest"]
+        with patch.object(install.sys, "platform", "darwin"):
+            with patch.object(install.shutil, "which", side_effect=which({"brew": "/opt/homebrew/bin/brew", "npm": "/usr/bin/npm"})):
+                self.assertEqual(install.paseo_install_command(), ["/opt/homebrew/bin/brew", "install", "--cask", "paseo"])
+            with patch.object(install.shutil, "which", side_effect=which({"npm": "/usr/bin/npm"})):
+                self.assertEqual(install.paseo_install_command(), npm_command)
+        with patch.object(install.sys, "platform", "linux"):
+            # Linuxbrew is not Paseo's documented Linux install; npm is.
+            with patch.object(install.shutil, "which", side_effect=which({"brew": "/home/linuxbrew/.linuxbrew/bin/brew", "npm": "/usr/bin/npm"})):
+                self.assertEqual(install.paseo_install_command(), npm_command)
+            with patch.object(install.shutil, "which", return_value=None):
+                self.assertIsNone(install.paseo_install_command())
+
+    def test_install_paseo_runs_the_installer_and_locates_the_executable(self):
+        prefix = self.base / "npm-global"
+        installed = prefix / "bin" / "paseo"
+        installed.parent.mkdir(parents=True)
+        installed.write_text("#!/bin/sh\n")
+        installed.chmod(0o755)
+        npm_command = ["/usr/bin/npm", "install", "-g", "@getpaseo/cli@latest"]
+        brew_command = ["/opt/homebrew/bin/brew", "install", "--cask", "paseo"]
+
+        def fake_run(command, install_status=0, **kwargs):
+            if command[1:] == ["prefix", "-g"]:
+                return subprocess.CompletedProcess(command, 0, stdout=f"{prefix}\n", stderr="")
+            self.assertNotIn("capture_output", kwargs)  # the installer's output stays on the terminal
+            return subprocess.CompletedProcess(command, install_status)
+
+        with patch.object(install.subprocess, "run", side_effect=fake_run) as run, \
+             patch.object(install.shutil, "which", return_value=str(installed)), \
+             patch.object(install, "say") as say:
+            self.assertEqual(install.install_paseo(npm_command), str(installed))
+            self.assertEqual(run.call_args_list[0].args[0], npm_command)
+            self.assertTrue(any(message.startswith("Installing Paseo: /usr/bin/npm install -g @getpaseo/cli@latest")
+                                for message in (call.args[0] for call in say.call_args_list)))
+        # A global npm bin directory that is not on PATH yet is still found.
+        with patch.object(install.subprocess, "run", side_effect=fake_run), \
+             patch.object(install.shutil, "which", return_value=None), \
+             patch.object(install, "say") as say:
+            self.assertEqual(install.install_paseo(npm_command), str(installed))
+            self.assertTrue(any("is not on PATH" in call.args[0] for call in say.call_args_list))
+            with self.assertRaisesRegex(runtime.SetupError, "no paseo executable was found"):
+                install.install_paseo(brew_command)
+        # Failures explain the npm prefix fix only for npm.
+        with patch.object(install.subprocess, "run", side_effect=lambda command, **kw: fake_run(command, 1)), \
+             patch.object(install, "say"):
+            with self.assertRaisesRegex(runtime.SetupError, "npm config set prefix") as raised:
+                install.install_paseo(npm_command)
+            self.assertIn("--skip-paseo", str(raised.exception))
+            with self.assertRaisesRegex(runtime.SetupError, "Paseo installation failed") as raised:
+                install.install_paseo(brew_command)
+            self.assertNotIn("npm config", str(raised.exception))
+
+    def test_missing_paseo_is_installed_on_request(self):
+        paseo = self.fake_paseo("paseo", "print('paseo')\n")
+        args = self.staged_args("--skip-plane")
+        command = ["/usr/bin/npm", "install", "-g", "@getpaseo/cli@latest"]
+        settings_file = Path(self.settings["config_dir"]) / "settings.json"
+        paseo_config = self.base / "paseo-home" / "config.json"
+        with self.assertRaises(SystemExit):
+            install.parser().parse_args([*args, "--install-paseo", "--skip-paseo"])
+        with patch.object(install, "detect_paseo", return_value=None), \
+             patch.object(install, "paseo_install_command", return_value=command):
+            # Staged and noninteractive runs do not install; they say how to.
+            with patch.object(install, "install_paseo") as installer, patch.object(install, "ask") as prompt, \
+                 patch.object(install, "say") as say:
+                install.install(install.parser().parse_args(args))
+                installer.assert_not_called()
+                prompt.assert_not_called()
+                self.assertIn("Paseo not detected (pass --install-paseo to install it); skipping Paseo configuration",
+                              [call.args[0] for call in say.call_args_list])
+            self.assertFalse(paseo_config.exists())
+            # Interactive runs ask; skip leaves Paseo out, Enter installs and configures it.
+            for answer, expect_install in (("skip", False), ("", True)):
+                with self.subTest(answer=answer), \
+                     patch.object(runtime.Runtime, "has_login", return_value=True), \
+                     patch.object(runtime.Runtime, "doctor"), \
+                     patch.object(install.sys.stdin, "isatty", return_value=True), \
+                     patch.object(install, "ask", return_value=answer) as prompt, \
+                     patch.object(install, "masked_input", return_value="skip"), \
+                     patch.object(install, "install_paseo", return_value=str(paseo)) as installer, \
+                     patch.object(install, "say") as say:
+                    opts = install.parser().parse_args(args)
+                    opts.skip_login = False
+                    install.install(opts)
+                    prompt.assert_called_once_with("Install Paseo now? (Enter for yes; type skip to skip Paseo): ")
+                    self.assertTrue(any(shlex.join(command) in call.args[0] for call in say.call_args_list))
+                    self.assertEqual(installer.called, expect_install)
+                    self.assertEqual(paseo_config.exists(), expect_install)
+                    self.assertEqual(runtime.read_json(settings_file).get("paseo_bin"), str(paseo) if expect_install else None)
+            self.assertIn("claude-codex", runtime.read_json(paseo_config)["agents"]["providers"])
+            # --install-paseo installs without asking, even when staged.
+            paseo_config.unlink()
+            with patch.object(install, "install_paseo", return_value=str(paseo)) as installer, \
+                 patch.object(install, "ask") as prompt:
+                install.install(install.parser().parse_args([*args, "--install-paseo"]))
+                installer.assert_called_once_with(command)
+                prompt.assert_not_called()
+            self.assertTrue(paseo_config.exists())
+        # Without Homebrew or npm the reason is stated; --skip-paseo never installs.
+        with patch.object(install, "detect_paseo", return_value=None), \
+             patch.object(install, "paseo_install_command", return_value=None), \
+             patch.object(install, "install_paseo") as installer, patch.object(install, "say") as say:
+            install.install(install.parser().parse_args([*args, "--install-paseo"]))
+            installer.assert_not_called()
+            self.assertIn("Paseo not detected and neither Homebrew nor npm is available to install it; "
+                          "skipping Paseo configuration", [call.args[0] for call in say.call_args_list])
+        with patch.object(install, "paseo_install_command") as command_lookup, \
+             patch.object(install, "install_paseo") as installer, patch.object(install, "say") as say:
+            install.install(install.parser().parse_args([*args, "--skip-paseo"]))
+            command_lookup.assert_not_called()
+            installer.assert_not_called()
+            self.assertIn("Paseo integration skipped; skipping Paseo configuration", [call.args[0] for call in say.call_args_list])
+
+    def test_codex_sign_in_can_be_declined_interactively_or_by_flag(self):
+        paseo = self.fake_paseo("paseo", "print('paseo')\n")
+        args = self.staged_args("--paseo-bin", str(paseo), "--skip-plane")
+        settings_file = Path(self.settings["config_dir"]) / "settings.json"
+        cases = (("skip", None, False), ("", None, True), ("SKIP", None, False), ("anything", "--skip-codex-login", False))
+        for answer, flag, expect_login in cases:
+            with self.subTest(answer=answer, flag=flag):
+                opts = install.parser().parse_args([*args, flag] if flag else args)
+                opts.skip_login = False
+                with patch.object(runtime.Runtime, "has_login", return_value=False), \
+                     patch.object(runtime.Runtime, "login") as login, \
+                     patch.object(runtime.Runtime, "doctor") as doctor, \
+                     patch.object(install.sys.stdin, "isatty", return_value=True), \
+                     patch.object(install, "ask", return_value=answer) as prompt, \
+                     patch.object(install, "masked_input", return_value="sk-ant-oat01-pasted"), \
+                     patch.object(install, "say") as say:
+                    install.install(opts)
+                messages = [call.args[0] for call in say.call_args_list]
+                if flag:
+                    prompt.assert_not_called()
+                else:
+                    prompt.assert_called_once_with("Sign in with ChatGPT for Claude Codex now? (Enter for yes; type skip to skip): ")
+                self.assertEqual(login.called, expect_login)
+                self.assertEqual(doctor.called, expect_login)
+                self.assertEqual(any(message.startswith("Claude Codex sign-in skipped") for message in messages), not expect_login)
+                # Declining Claude Codex does not skip the second account's step.
+                self.assertEqual(runtime.read_json(settings_file)["peppy_oauth_token"], "sk-ant-oat01-pasted")
+                saved = runtime.read_json(settings_file)
+                del saved["peppy_oauth_token"]
+                runtime.write_json(settings_file, saved)
+        # An existing login is verified without asking; noninteractive runs sign in as before.
+        for interactive in (True, False):
+            with patch.object(runtime.Runtime, "has_login", return_value=interactive), \
+                 patch.object(runtime.Runtime, "login") as login, \
+                 patch.object(runtime.Runtime, "doctor") as doctor, \
+                 patch.object(install.sys.stdin, "isatty", return_value=interactive), \
+                 patch.object(install, "ask") as prompt, \
+                 patch.object(install, "masked_input", return_value="skip"), \
+                 patch.object(install, "say"):
+                opts = install.parser().parse_args(args)
+                opts.skip_login = False
+                install.install(opts)
+                prompt.assert_not_called()
+                self.assertEqual(login.called, not interactive)
+                doctor.assert_called_once()
+        # --skip-login stages everything and never asks.
+        with patch.object(install, "ask") as prompt, patch.object(runtime.Runtime, "login") as login:
+            install.install(install.parser().parse_args(args))
             prompt.assert_not_called()
+            login.assert_not_called()
+
+    def test_interactive_install_signs_in_the_second_account_for_paseo(self):
+        paseo = self.fake_paseo("paseo", "print('paseo')\n")
+        opts = install.parser().parse_args(self.staged_args("--paseo-bin", str(paseo), "--skip-plane"))
+        opts.skip_login = False
+        settings_file = Path(self.settings["config_dir"]) / "settings.json"
+        peppy_dir = str(self.base / "claude-peppy")
+        claude_bin = opts.claude_bin
+        frame = "Your OAuth token:\r\n\r\n  \x1b[33msk-ant-oat01-fresh\x1b[39m\r\n\r\n  Store this token securely.\r\n"
+
+        def fake_setup_token(argv, env):
+            self.assertEqual(argv, [claude_bin, "setup-token"])
+            self.assertEqual(env["CLAUDE_CONFIG_DIR"], peppy_dir)
+            for name in ("CLAUDE_PEPPY_PASEO", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"):
+                self.assertNotIn(name, env)
+            return 0, frame.encode()
+
+        ambient = {"CLAUDE_PEPPY_PASEO": "1", "CLAUDE_CODE_OAUTH_TOKEN": "ambient-token", "ANTHROPIC_API_KEY": "key"}
+        with patch.dict(os.environ, ambient), \
+             patch.object(runtime.Runtime, "has_login", return_value=True), \
+             patch.object(runtime.Runtime, "doctor"), \
+             patch.object(install.sys.stdin, "isatty", return_value=True), \
+             patch.object(install, "masked_input", return_value=""), \
+             patch.object(install, "run_on_terminal", side_effect=fake_setup_token) as setup_token, \
+             patch.object(install, "say") as say:
+            install.install(opts)
+            setup_token.assert_called_once()
+            messages = [call.args[0] for call in say.call_args_list]
+            self.assertTrue(any("Saved the second account's token" in message for message in messages))
+            self.assertFalse(any("sk-ant-oat01-fresh" in message for message in messages))
+            self.assertFalse(any("No token is saved" in message for message in messages))
+            self.assertEqual(runtime.read_json(settings_file)["peppy_oauth_token"], "sk-ant-oat01-fresh")
+            self.assertEqual(settings_file.stat().st_mode & 0o777, 0o600)
+            # A rerun keeps the saved token and does not ask again.
+            install.install(install.parser().parse_args(self.staged_args("--paseo-bin", str(paseo), "--skip-plane")))
+            setup_token.assert_called_once()
+            # A skipped or failed sign-in completes the installation and prints the fallback.
+            for outcome in ("skip", "failed"):
+                with self.subTest(outcome=outcome):
+                    saved = runtime.read_json(settings_file)
+                    saved.pop("peppy_oauth_token", None)
+                    runtime.write_json(settings_file, saved)
+                    setup_token.reset_mock()
+                    say.reset_mock()
+                    install.masked_input.return_value = "skip" if outcome == "skip" else ""
+                    setup_token.side_effect = None
+                    setup_token.return_value = (1, b"Login cancelled\r\n")
+                    install.install(opts)
+                    self.assertEqual(setup_token.call_count, 0 if outcome == "skip" else 1)
+                    self.assertNotIn("peppy_oauth_token", runtime.read_json(settings_file))
+                    messages = [call.args[0] for call in say.call_args_list]
+                    self.assertTrue(any("No token is saved" in message for message in messages))
+                    self.assertTrue(any("claude-peppy setup-token" in message for message in messages))
+        self.assertNotIn("sk-ant-oat01", (self.base / "paseo-home" / "config.json").read_text())
+        # Staged and noninteractive runs never start a sign-in.
+        for interactive in (True, False):
+            with patch.object(install.sys.stdin, "isatty", return_value=interactive), \
+                 patch.object(install, "run_on_terminal") as setup_token, \
+                 patch.object(install, "masked_input") as prompt:
+                install.install(install.parser().parse_args(self.staged_args("--paseo-bin", str(paseo), "--skip-plane")))
+                setup_token.assert_not_called()
+                prompt.assert_not_called()
 
     def test_peppy_token_is_saved_privately_retained_and_kept_from_paseo(self):
         paseo = self.fake_paseo("paseo", "print('paseo')\n")

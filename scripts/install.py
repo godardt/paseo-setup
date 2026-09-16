@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
-"""One-command, per-user installer. No sudo and no global npm installs."""
+"""One-command, per-user installer. No sudo; the only global npm install is Paseo, and only on request."""
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import pty
 import re
 import secrets
+import select
 import shlex
 import shutil
+import signal
+import string
 import subprocess
 import sys
 import tarfile
 import tempfile
 import termios
 import time
+import tty
 
 import plane_mcp
 from claude_codex import (
     CONTEXT_WINDOW, EFFORTS, REASONING_MODES, ULTRACODE_MODEL, MARKER, MODEL, PASEO_MARKER, PEPPY_PASEO_MARKER,
-    Runtime, SetupError, atomic_write, model_id, file_lock, proxy_config, read_json, say, write_json,
+    Runtime, SetupError, atomic_write, model_id, file_lock, peppy_env, proxy_config, read_json, say, write_json,
 )
 
 PROXY_VERSION = "7.2.155"
@@ -209,8 +215,9 @@ def warn_legacy_patch(paseo_bin):
 
 
 def detect_paseo(explicit, previous=None, data_dir=None):
-    # Paseo is managed by the user. Never install it or select a cached version
-    # from an earlier claude-codex installation over the user's PATH.
+    # Paseo is managed by the user (installed on request by install_paseo, never
+    # here). Never select a cached version from an earlier claude-codex
+    # installation over the user's PATH.
     if explicit:
         return executable(explicit, "paseo")
     found = shutil.which("paseo")
@@ -230,6 +237,49 @@ def detect_paseo(explicit, previous=None, data_dir=None):
                 say(f"Paseo on PATH is the desktop app bundle {found}; reusing previously selected {previous}")
             return str(Path(previous).absolute())
     return found
+
+
+PASEO_NPM_PACKAGE = "@getpaseo/cli"
+
+
+def paseo_install_command():
+    """Paseo's documented install for this platform: the Homebrew cask on macOS, npm elsewhere."""
+    brew = shutil.which("brew") if sys.platform == "darwin" else None
+    if brew:
+        return [brew, "install", "--cask", "paseo"]
+    npm = shutil.which("npm")
+    if npm:
+        return [npm, "install", "-g", f"{PASEO_NPM_PACKAGE}@latest"]
+    return None
+
+
+def wants_paseo_install(command):
+    say("Paseo was not detected. It can be installed now with the latest release, using:")
+    say("  " + shlex.join(command))
+    return ask("Install Paseo now? (Enter for yes; type skip to skip Paseo): ").lower() != "skip"
+
+
+def install_paseo(command):
+    """Run Paseo's installer on this terminal and return the installed executable."""
+    say(f"Installing Paseo: {shlex.join(command)}")
+    if subprocess.run(command).returncode != 0:
+        hint = (" If npm reported a permissions error, give it a user-writable prefix "
+                "(npm config set prefix ~/.local) and rerun." if Path(command[0]).name == "npm" else "")
+        raise SetupError("Paseo installation failed; see the output above." + hint
+                         + " Install Paseo yourself and rerun ./install.sh, or use --skip-paseo.")
+    found = shutil.which("paseo")
+    if not found and Path(command[0]).name == "npm":
+        # The global npm bin directory may not be on PATH yet.
+        prefix = subprocess.run([command[0], "prefix", "-g"], capture_output=True, text=True).stdout.strip()
+        candidate = Path(prefix) / "bin" / "paseo"
+        if prefix and candidate.is_file() and os.access(candidate, os.X_OK):
+            say(f"{candidate.parent} is not on PATH; add it to use the paseo command directly.")
+            found = str(candidate)
+    if not found:
+        raise SetupError("Paseo was installed but no paseo executable was found on PATH; open a new terminal and "
+                         "rerun ./install.sh, or pass --paseo-bin")
+    say(f"Installed Paseo: {found}")
+    return str(Path(found).absolute())
 
 
 def provider(settings):
@@ -497,7 +547,12 @@ def validate_oauth_token(value):
 
 
 def prepare_peppy_token(opts, previous, environment_token):
-    """Select the second account's long-lived token without writing files."""
+    """Select the second account's long-lived token without writing files.
+
+    Interactive runs are not asked here: the token comes from `claude
+    setup-token`, which needs the Claude binary this run may still have to
+    install, so the sign-in is offered later by acquire_peppy_token.
+    """
     if opts.peppy_oauth_token_file:
         try:
             value = absolute(opts.peppy_oauth_token_file).read_text()
@@ -506,18 +561,177 @@ def prepare_peppy_token(opts, previous, environment_token):
         return validate_oauth_token(value)
     if environment_token is not None:
         return validate_oauth_token(environment_token)
-    if previous.get("peppy_oauth_token"):
-        return previous["peppy_oauth_token"]
-    if opts.skip_login or not sys.stdin.isatty():
-        return None
+    return previous.get("peppy_oauth_token") or None
+
+
+# Long-lived tokens from claude setup-token; the two digits are the token format version.
+OAUTH_TOKEN_START = re.compile(r"sk-ant-oat\d+-")
+OAUTH_TOKEN_CHARS = frozenset(string.ascii_letters + string.digits + "-_")
+# CSI and OSC sequences, other escapes, and control characters other than newlines.
+TERMINAL_CONTROL = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|[\x00-\x08\x0b-\x1f\x7f]")
+SETUP_TOKEN_FALLBACK = ("For Paseo: rerun ./install.sh and sign in with the second account when asked, or run "
+                        "claude-peppy setup-token and pass the token with --peppy-oauth-token-file.")
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def run_on_terminal(argv, env, stdin_fd=None, stdout_fd=None):
+    """Run an interactive command, relaying it to this terminal and capturing its output.
+
+    The command's input is a pseudo-terminal wired to this one, so browser
+    sign-in prompts, pasted codes, and Ctrl-C behave normally. Its output is a
+    pipe, echoed here as it arrives: Claude Code's screen renderer only redraws
+    changed cells when it writes to a terminal, so what it shows can then not
+    be reassembled from the bytes it sends, while on a pipe it prints each
+    screen as plain lines. Returns the exit status and the captured output.
+    """
+    stdin_fd = sys.stdin.fileno() if stdin_fd is None else stdin_fd
+    stdout_fd = sys.stdout.fileno() if stdout_fd is None else stdout_fd
+    master, slave = pty.openpty()
+
+    def resize(*_):
+        try:
+            fcntl.ioctl(master, termios.TIOCSWINSZ, fcntl.ioctl(stdin_fd, termios.TIOCGWINSZ, b"\0" * 8))
+        except OSError:
+            pass
+
+    def become_terminal_owner():  # pragma: no cover - child process
+        try:
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        except OSError:
+            pass
+
+    resize()
+    child = subprocess.Popen(argv, stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                             start_new_session=True, preexec_fn=become_terminal_owner)
+    os.close(slave)
+    output = child.stdout.fileno()
+    captured = []
+    original_handler = signal.signal(signal.SIGWINCH, resize)
+    original_mode = termios.tcgetattr(stdin_fd)
+    tty.setraw(stdin_fd)
+    try:
+        watched = [output, master, stdin_fd]
+        interrupts = 0
+        while output in watched:
+            ready, _, _ = select.select(watched, [], [])
+            for fd in ready:
+                try:
+                    data = os.read(fd, 65536)
+                except OSError:  # Linux reports EIO on a pseudo-terminal whose other side closed.
+                    data = b""
+                if not data:
+                    watched.remove(fd)
+                elif fd == stdin_fd:
+                    try:
+                        write_all(master, data)
+                    except OSError:  # Typed after the command closed its terminal.
+                        pass
+                    if b"\x03" in data:
+                        # The command reads raw keys, so its terminal generates no
+                        # signal for Ctrl-C; deliver one (twice: terminate).
+                        interrupts += 1
+                        child.send_signal(signal.SIGINT if interrupts == 1 else signal.SIGTERM)
+                else:
+                    if fd == output:
+                        captured.append(data)
+                    write_all(stdout_fd, data)
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, original_mode)
+        signal.signal(signal.SIGWINCH, original_handler)
+        os.close(master)
+        child.stdout.close()
+    return child.wait(), b"".join(captured)
+
+
+def printed_oauth_tokens(output):
+    """Tokens shown by `claude setup-token` in its captured output.
+
+    Claude Code prints the token as a paragraph of its own, separated from the
+    surrounding text by blank lines, and may hard-wrap it. Continuation lines
+    are joined up to the next blank line. Each screen is printed in full, so a
+    token can repeat; the result is a set.
+    """
+    text = TERMINAL_CONTROL.sub("", output.decode("utf-8", "replace"))
+    lines = [line.strip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    tokens = set()
+    for index, line in enumerate(lines):
+        match = OAUTH_TOKEN_START.search(line)
+        if match is None:
+            continue
+        token = line[match.start():]
+        for continuation in lines[index + 1:]:
+            if not continuation:
+                break
+            token += continuation
+        if set(token) <= OAUTH_TOKEN_CHARS:
+            tokens.add(token)
+    return tokens
+
+
+def sign_in_second_account(settings):
+    """Run `claude setup-token` for the second account and return the token it prints."""
+    source = {name: value for name, value in os.environ.items() if name != PEPPY_PASEO_MARKER}
+    status, output = run_on_terminal([settings["claude_bin"], "setup-token"], peppy_env(settings, source))
+    tokens = printed_oauth_tokens(output)
+    if status != 0 or not tokens:
+        raise SetupError("claude setup-token did not print a token")
+    if len(tokens) > 1:
+        raise SetupError("claude setup-token printed more than one token")
+    return validate_oauth_token(tokens.pop())
+
+
+def acquire_peppy_token(settings):
+    """Interactively obtain the token for the second account's Paseo sessions.
+
+    Called once the Claude binary and the launcher exist, so the sign-in can
+    happen in the same run. Returns None when the user skips or the sign-in
+    fails; the installation is complete either way and the fallback is printed.
+    """
     say("Paseo runs the second account's sessions in the daemon's Claude profile and selects the")
-    say("account with a long-lived token. Generate one with: claude-peppy setup-token")
+    say("account with a long-lived token. Press Enter to sign in with the second account in the browser")
+    say("and generate the token now, paste an existing token from claude setup-token, or type skip.")
     say("The token stays in this installation's private settings; it is not written into Paseo's configuration.")
     try:
-        value = masked_input("Second account token from claude setup-token (masked with *; Enter to skip): ")
+        value = masked_input("Second account token (masked with *; Enter to sign in now; type skip to skip): ").strip()
     except (EOFError, OSError, ValueError, termios.error):
         raise SetupError("Cannot read a masked token; use --peppy-oauth-token-file or CLAUDE_PEPPY_OAUTH_TOKEN") from None
-    return validate_oauth_token(value) if value.strip() else None
+    if value.lower() == "skip":
+        return None
+    if value:
+        return validate_oauth_token(value)
+    say("Sign in with the second account in the browser that opens, or at the printed URL.")
+    try:
+        token = sign_in_second_account(settings)
+    except SetupError as exc:
+        say(f"{exc}; no token was saved for the second account's Paseo sessions.")
+        say(SETUP_TOKEN_FALLBACK)
+        return None
+    say("Saved the second account's token for Paseo.")
+    return token
+
+
+def ask(prompt):
+    """Read one line of plain (non-secret) input from the terminal; EOF counts as an empty answer."""
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    line = sys.stdin.readline()
+    return line.strip()
+
+
+CODEX_LOGIN_SKIPPED = ("Claude Codex sign-in skipped: claude-codex and the Paseo 'Claude Codex' provider cannot run "
+                       "until you sign in with: claude-codex-proxy login")
+
+
+def wants_codex_login():
+    """Ask an interactive user whether to sign in with ChatGPT for Claude Codex now."""
+    say("Claude Codex runs Claude Code with GPT-6 Astra through a ChatGPT subscription and needs a ChatGPT sign-in.")
+    say("Press Enter to sign in now, or type skip to leave it for later (claude-codex-proxy login).")
+    return ask("Sign in with ChatGPT for Claude Codex now? (Enter for yes; type skip to skip): ").lower() != "skip"
 
 
 def configure_plane(config_dir, data_dir, api_key):
@@ -559,11 +773,17 @@ def parser():
     p.add_argument("--device-login", action="store_true", help="Use ChatGPT device-code login")
     p.add_argument("--no-browser", action="store_true", help="Print OAuth URL without opening a browser")
     p.add_argument("--skip-login", action="store_true", help="Stage installation without authenticating or prompting for Plane credentials")
+    p.add_argument("--skip-codex-login", action="store_true",
+                   help="Skip the ChatGPT sign-in and live verification for Claude Codex; the other steps still run")
     plane = p.add_mutually_exclusive_group()
     plane.add_argument("--plane-api-key-file", help="File containing a Plane personal API token for read-only peppy access (or set PLANE_API_KEY)")
     plane.add_argument("--skip-plane", action="store_true", help="Skip Plane setup, preserving any previously configured connection")
     p.add_argument("--skip-smoke-test", action="store_true", help="Skip the small live Astra verification request")
-    p.add_argument("--skip-paseo", action="store_true", help="Install terminal integration only")
+    paseo_group = p.add_mutually_exclusive_group()
+    paseo_group.add_argument("--skip-paseo", action="store_true", help="Install terminal integration only")
+    paseo_group.add_argument("--install-paseo", action="store_true",
+                             help="When no Paseo is detected, install the latest release without asking "
+                                  "(Homebrew cask on macOS, npm install -g elsewhere)")
     p.add_argument("--skip-paseo-start", action="store_true", help="Write Paseo configuration without restarting its daemon")
     p.add_argument("--no-path", action="store_true", help="Do not edit shell startup files")
     return p
@@ -602,6 +822,15 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
         raise SetupError("--peppy-config-dir must not be the primary Claude profile ~/.claude "
                          "or the installer's isolated Claude profile")
     detected_paseo = None if opts.skip_paseo else detect_paseo(opts.paseo_bin, previous.get("paseo_bin"), data_dir)
+    paseo_skip_reason = "Paseo integration skipped" if opts.skip_paseo else "Paseo not detected"
+    if detected_paseo is None and not opts.skip_paseo:
+        command = paseo_install_command()
+        if command is None:
+            paseo_skip_reason += " and neither Homebrew nor npm is available to install it"
+        elif opts.install_paseo or (not opts.skip_login and sys.stdin.isatty() and wants_paseo_install(command)):
+            detected_paseo = install_paseo(command)
+        elif not opts.install_paseo and (opts.skip_login or not sys.stdin.isatty()):
+            paseo_skip_reason += " (pass --install-paseo to install it)"
     if detected_paseo:
         assert_original_binary(detected_paseo, bin_dir, ("paseo-codex",), "--paseo-bin", "Paseo")
     use_paseo = detected_paseo is not None
@@ -620,7 +849,7 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
                                  "untouched; rerun with Paseo detected so the claude-peppy provider entry "
                                  "can be updated, or remove that entry first")
     if not use_paseo:
-        say("Paseo integration skipped" if opts.skip_paseo else "Paseo not detected; skipping Paseo installation and configuration")
+        say(f"{paseo_skip_reason}; skipping Paseo configuration")
     paseo_home = absolute(opts.paseo_home)
     paseo_config = paseo_home / "config.json"
     if use_paseo:
@@ -645,9 +874,6 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     # Validate before downloads, stopping services, or replacing configuration.
     plane_key = prepare_plane(opts, previous, config_dir, data_dir, plane_environment_key)
     peppy_token = prepare_peppy_token(opts, previous, peppy_environment_token) if use_peppy else None
-    if use_paseo and use_peppy and not peppy_token:
-        say("No token for the second account's Paseo sessions yet; the Claude Peppy provider will refuse to "
-            "start sessions until one is saved (claude-peppy setup-token, then rerun ./install.sh).")
     claude_bin = resolve_cli("claude", opts.claude_bin, f"@anthropic-ai/claude-code@{CLAUDE_VERSION}", data_dir, previous.get("claude_bin"))
     assert_original_binary(claude_bin, bin_dir, ("claude-codex", "claude-peppy"), "--claude-bin", "Claude")
     paseo_bin = detected_paseo
@@ -710,10 +936,28 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     if not opts.no_path:
         add_path(bin_dir)
     runtime = Runtime(settings)
+    codex_login_skipped = False
     if not opts.skip_login:
-        if not runtime.has_login():
-            runtime.login(opts.device_login, opts.no_browser)
-        runtime.doctor(smoke=not opts.skip_smoke_test)
+        # An existing ChatGPT login is verified without asking; a first sign-in
+        # can be declined, leaving Claude Codex staged and the other steps running.
+        if runtime.has_login():
+            codex_login = True
+        elif opts.skip_codex_login:
+            codex_login = False
+        else:
+            codex_login = not sys.stdin.isatty() or wants_codex_login()
+        if codex_login:
+            if not runtime.has_login():
+                runtime.login(opts.device_login, opts.no_browser)
+            runtime.doctor(smoke=not opts.skip_smoke_test)
+        else:
+            codex_login_skipped = True
+            say(CODEX_LOGIN_SKIPPED)
+        if use_paseo and use_peppy and not peppy_token and sys.stdin.isatty():
+            peppy_token = acquire_peppy_token(settings)
+            if peppy_token:
+                settings["peppy_oauth_token"] = peppy_token
+                write_json(settings_file, settings)
     if paseo_bin and not opts.skip_paseo_start:
         env = dict(os.environ)
         env["PASEO_HOME"] = str(paseo_home)
@@ -727,7 +971,9 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     if use_peppy:
         say(f"Second account: {bin_dir / 'claude-peppy'} (profile {peppy_dir}); run it once to sign in.")
         if paseo_bin and not peppy_token:
-            say("For Paseo: run claude-peppy setup-token, then rerun ./install.sh and paste the token.")
+            say("No token is saved for the second account's Paseo sessions; the Claude Peppy provider refuses "
+                "to start sessions until one is.")
+            say(SETUP_TOKEN_FALLBACK)
     if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
         say(f'For this terminal: export PATH={shlex.quote(str(bin_dir))}:"$PATH" (or open a new terminal)')
     if paseo_bin:
@@ -735,6 +981,8 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
         if use_peppy:
             say("In Paseo, select 'Claude Peppy' to use the second Claude account.")
         say("Paseo plugin 'claude-codex' installed; check it with: paseo-codex plugin ls")
+    if codex_login_skipped:
+        say(CODEX_LOGIN_SKIPPED)
     if opts.skip_login:
         say("Installation staged; login and live verification were skipped. Run claude-codex-proxy login when ready.")
 
