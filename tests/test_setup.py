@@ -459,7 +459,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(peppy["extends"], "claude")
         self.assertEqual(peppy["label"], "Claude Peppy")
         self.assertEqual(peppy["command"], [str(self.base / "bin" / "claude-peppy")])
-        self.assertEqual(peppy["env"], {"CLAUDE_CONFIG_DIR": str(self.base / "claude-peppy")})
+        self.assertEqual(peppy["env"], {"CLAUDE_CONFIG_DIR": str(self.base / "claude-peppy"),
+                                        "CLAUDE_CODEX_MODEL_LABEL_PREFIX": "Peppy"})
         self.assertNotIn("models", peppy)
         self.assertNotIn("test-local-key", config_file.read_text())
         first = config_file.read_bytes()
@@ -561,7 +562,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(peppy_launcher.read_text().splitlines()[1], install.MARKER)
         peppy_provider_entry = runtime.read_json(self.base / "paseo" / "config.json")["agents"]["providers"]["claude-peppy"]
         self.assertEqual(peppy_provider_entry["command"], [str(peppy_launcher)])
-        self.assertEqual(peppy_provider_entry["env"], {"CLAUDE_CONFIG_DIR": str(self.base / "claude-peppy")})
+        self.assertEqual(peppy_provider_entry["env"], {"CLAUDE_CONFIG_DIR": str(self.base / "claude-peppy"),
+                                                       "CLAUDE_CODEX_MODEL_LABEL_PREFIX": "Peppy"})
         patched_reader = reader.read_text()
         self.assertEqual(patched_reader, paseo_compat.patch_source(original_reader))
         backups = list(reader.parent.glob("agent.js.claude-codex-backup-*"))
@@ -980,7 +982,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(custom.stat().st_mode & 0o777, 0o700)
         # A user-prepared profile keeps its own permissions.
         prepared = self.base / "prepared-profile"
-        prepared.mkdir(mode=0o755)
+        prepared.mkdir()
+        prepared.chmod(0o755)  # mkdir's mode argument is masked by the shell umask.
         install.install(install.parser().parse_args(self.staged_args("--skip-paseo", "--peppy-config-dir", str(prepared))))
         self.assertEqual(prepared.stat().st_mode & 0o777, 0o755)
 

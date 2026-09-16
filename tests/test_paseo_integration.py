@@ -281,7 +281,8 @@ class PaseoIntegrationTests(unittest.TestCase):
                                     capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             providers = runtime.read_json(paseo_home / "config.json")["agents"]["providers"]
-            self.assertEqual(providers["claude-peppy"]["env"], {"CLAUDE_CONFIG_DIR": str(resolved_peppy)})
+            self.assertEqual(providers["claude-peppy"]["env"], {"CLAUDE_CONFIG_DIR": str(resolved_peppy),
+                                                                "CLAUDE_CODEX_MODEL_LABEL_PREFIX": "Peppy"})
             paseo = str(base / "bin" / "paseo-codex")
             try:
                 self.run_paseo(paseo, env, "daemon", "restart", "--json", timeout=90)
