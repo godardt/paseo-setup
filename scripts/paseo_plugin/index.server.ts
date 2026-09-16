@@ -2,8 +2,10 @@
 //
 // This uses only Paseo's public plugin API, so it keeps working across Paseo
 // upgrades. The daemon compiles it itself; there is no build step and no
-// runtime dependency (the SDK import below is type-only).
+// runtime dependency (the SDK import below is type-only; the connector module
+// is generated next to this file by the installer).
 import type { PluginServerContext } from "@getpaseo/plugin/server";
+import { PLANE_MCP_SERVERS } from "./server/plane-connector.ts";
 
 // Providers written by the installer whose Claude Code launcher disables auto
 // mode: its permission classifier cannot run on the Codex gateway, so the
@@ -15,19 +17,66 @@ export const GATEWAY_PROVIDERS: readonly string[] = ["claude-codex"];
 export const UNAVAILABLE_MODE = "auto";
 export const FALLBACK_MODE = "default";
 
+// Every Paseo provider that runs Claude Code: Paseo's built-in provider and
+// the two written by the installer. Paseo starts the built-in provider
+// directly, never through the claude-codex or claude-peppy launchers, so the
+// read-only Plane connector those launchers add with --mcp-config would
+// otherwise be missing from its agents. Paseo persists an agent's MCP servers
+// with its configuration, so the connector follows the agent across resumes
+// and daemon restarts; Claude Code treats a launcher copy of the same server
+// definition as one server.
+export const CLAUDE_PROVIDERS: readonly string[] = ["claude", "claude-codex", "claude-peppy"];
+
 export interface AgentCreateRequest {
-  config: { provider: string; modeId?: string; [key: string]: unknown };
+  config: {
+    provider: string;
+    modeId?: string;
+    mcpServers?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
   env?: Record<string, string>;
 }
 
 // Only an explicit request for the unavailable mode is rewritten. A request
 // without a mode is left alone so a child agent keeps inheriting its parent's
 // mode exactly as Paseo resolves it.
-export function resolveAgentCreate(request: AgentCreateRequest): AgentCreateRequest | undefined {
-  if (!GATEWAY_PROVIDERS.includes(request.config.provider) || request.config.modeId !== UNAVAILABLE_MODE) {
+export function resolveMode(config: AgentCreateRequest["config"]): string | undefined {
+  if (!GATEWAY_PROVIDERS.includes(config.provider) || config.modeId !== UNAVAILABLE_MODE) {
     return undefined;
   }
-  return { ...request, config: { ...request.config, modeId: FALLBACK_MODE } };
+  return FALLBACK_MODE;
+}
+
+// The connector servers missing from a Claude Code agent's request. A caller's
+// own server of the same name wins, so an explicit request is never replaced.
+export function missingPlaneServers(config: AgentCreateRequest["config"]): Record<string, unknown> | undefined {
+  if (!CLAUDE_PROVIDERS.includes(config.provider)) {
+    return undefined;
+  }
+  const existing = config.mcpServers ?? {};
+  const missing: Record<string, unknown> = {};
+  for (const [name, server] of Object.entries(PLANE_MCP_SERVERS)) {
+    if (!(name in existing)) {
+      missing[name] = server;
+    }
+  }
+  return Object.keys(missing).length > 0 ? missing : undefined;
+}
+
+export function resolveAgentCreate(request: AgentCreateRequest): AgentCreateRequest | undefined {
+  const modeId = resolveMode(request.config);
+  const servers = missingPlaneServers(request.config);
+  if (modeId === undefined && servers === undefined) {
+    return undefined;
+  }
+  const config = { ...request.config };
+  if (modeId !== undefined) {
+    config.modeId = modeId;
+  }
+  if (servers !== undefined) {
+    config.mcpServers = { ...(request.config.mcpServers ?? {}), ...servers };
+  }
+  return { ...request, config };
 }
 
 export default function contribute(server: PluginServerContext) {

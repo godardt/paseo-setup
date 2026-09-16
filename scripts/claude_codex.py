@@ -883,6 +883,183 @@ def control(settings, args):
             print(f"{key}: {settings.get(key, '(not configured)')}")
 
 
+WORKTREE_SETUP_COMMAND = "paseo-codex-worktree-setup"
+PASEO_PROJECT_CONFIG = "paseo.json"
+GIT_TIMEOUT = 120
+
+
+def worktree_git_env(source=None):
+    env = dict(os.environ if source is None else source)
+    # Never block a daemon-run setup step on a credential prompt.
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def git(args, cwd, env, check=True):
+    try:
+        result = subprocess.run(["git", *args], cwd=str(cwd), env=env, capture_output=True, text=True,
+                                timeout=GIT_TIMEOUT)
+    except FileNotFoundError:
+        raise SetupError("git is required for Paseo worktree setup") from None
+    except subprocess.TimeoutExpired:
+        raise SetupError(f"git {' '.join(args)} timed out after {GIT_TIMEOUT}s") from None
+    if check and result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise SetupError(f"git {' '.join(args)} failed" + (f": {detail}" if detail else ""))
+    return result
+
+
+def git_ref_exists(ref, cwd, env):
+    return git(["rev-parse", "--verify", "--quiet", ref + "^{commit}"], cwd, env, check=False).returncode == 0
+
+
+def read_worktree_metadata(worktree, env):
+    """Paseo's per-worktree record of how the worktree was created, or None.
+
+    Paseo stores it in the worktree's git directory (worktree.json under
+    paseo/), with baseRef only for branch-off worktrees and a change request
+    number only for pull request checkouts.
+    """
+    git_dir = git(["rev-parse", "--absolute-git-dir"], worktree, env).stdout.strip()
+    path = Path(git_dir) / "paseo" / "worktree.json"
+    if not path.is_file():
+        return None
+    try:
+        metadata = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise SetupError(f"Cannot read Paseo worktree metadata {path}: {exc}") from exc
+    return metadata if isinstance(metadata, dict) else None
+
+
+def strip_remote_prefix(name):
+    for prefix in ("refs/remotes/origin/", "refs/heads/", "origin/"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def origin_default_branch(worktree, env):
+    """The branch origin's HEAD points at, refreshing the local record if needed."""
+    for attempt in (0, 1):
+        result = git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], worktree, env, check=False)
+        ref = result.stdout.strip()
+        if result.returncode == 0 and ref.startswith("refs/remotes/origin/"):
+            return ref[len("refs/remotes/origin/"):]
+        if attempt == 0:
+            git(["remote", "set-head", "origin", "--auto"], worktree, env)
+    raise SetupError("Cannot determine the default branch of origin")
+
+
+def prepare_worktree(worktree, environ=None):
+    """Put a fresh Paseo worktree on the latest state of its base branch from origin.
+
+    Paseo cuts a branch-off worktree from the local base branch, which is only
+    as current as the last pull. This step, run by paseo.json's worktree setup
+    right after creation, fetches origin and moves a branch that has no commits
+    of its own onto origin's copy of the base branch (the repository default
+    branch unless another base was chosen). A checked-out existing branch is
+    fast-forwarded to its origin counterpart; a branch with its own commits or
+    a pull request checkout is left alone so nothing of the user's is lost.
+    """
+    env = worktree_git_env(environ)
+    worktree = Path(worktree)
+    if not (worktree / ".git").exists():
+        raise SetupError(f"{worktree} is not the root of a git worktree")
+    branch = git(["branch", "--show-current"], worktree, env).stdout.strip()
+    if not branch:
+        raise SetupError(f"{worktree} has a detached HEAD; check out a branch first")
+    metadata = read_worktree_metadata(worktree, env) or {}
+    if git(["status", "--porcelain", "--untracked-files=no"], worktree, env).stdout.strip():
+        # Paseo runs this on a freshly created worktree; a manual rerun must
+        # not discard edits to tracked files.
+        say(f"{WORKTREE_SETUP_COMMAND}: {worktree} has uncommitted changes; left unchanged.")
+        return 0
+    git(["fetch", "origin", "--prune"], worktree, env)
+    default_branch = origin_default_branch(worktree, env)
+    change_request = metadata.get("changeRequestLookupTarget") or {}
+    branched_off = bool(metadata.get("baseRef")) and not change_request.get("changeRequestNumber") \
+        and metadata.get("baseRefName") not in (None, branch)
+    if branched_off:
+        base = strip_remote_prefix(str(metadata["baseRefName"]))
+        target = f"refs/remotes/origin/{base}"
+        if not git_ref_exists(target, worktree, env):
+            say(f"{WORKTREE_SETUP_COMMAND}: base branch {base} has no copy on origin; {branch} left unchanged.")
+            return 0
+        head = git(["rev-parse", "HEAD"], worktree, env).stdout.strip()
+        wanted = git(["rev-parse", target + "^{commit}"], worktree, env).stdout.strip()
+        if head == wanted:
+            say(f"{WORKTREE_SETUP_COMMAND}: {branch} already matches origin/{base}.")
+        elif git(["merge-base", "--is-ancestor", "HEAD", target], worktree, env, check=False).returncode == 0:
+            git(["reset", "--hard", target], worktree, env)
+            say(f"{WORKTREE_SETUP_COMMAND}: moved {branch} to the latest origin/{base} ({wanted[:12]}).")
+        else:
+            say(f"{WORKTREE_SETUP_COMMAND}: {branch} has its own commits; left at {head[:12]} "
+                f"(origin/{base} is {wanted[:12]}).")
+        return 0
+    target = f"refs/remotes/origin/{branch}"
+    if not git_ref_exists(target, worktree, env):
+        say(f"{WORKTREE_SETUP_COMMAND}: {branch} has no copy on origin; left unchanged "
+            f"(origin default branch: {default_branch}).")
+        return 0
+    head = git(["rev-parse", "HEAD"], worktree, env).stdout.strip()
+    wanted = git(["rev-parse", target + "^{commit}"], worktree, env).stdout.strip()
+    if head == wanted:
+        say(f"{WORKTREE_SETUP_COMMAND}: {branch} already matches origin/{branch}.")
+    elif git(["merge-base", "--is-ancestor", "HEAD", target], worktree, env, check=False).returncode == 0:
+        git(["merge", "--ff-only", target], worktree, env)
+        say(f"{WORKTREE_SETUP_COMMAND}: fast-forwarded {branch} to origin/{branch} ({wanted[:12]}).")
+    else:
+        say(f"{WORKTREE_SETUP_COMMAND}: {branch} and origin/{branch} have diverged; left at {head[:12]}.")
+    return 0
+
+
+def register_worktree_setup(repo):
+    """Add the setup command to the repository's paseo.json, first in the list."""
+    repo = Path(repo).absolute()
+    if not (repo / ".git").exists():
+        raise SetupError(f"{repo} is not the root of a git repository")
+    path = repo / PASEO_PROJECT_CONFIG
+    config = read_json(path) if path.exists() else {}
+    worktree = config.get("worktree", {})
+    if not isinstance(worktree, dict):
+        raise SetupError(f"worktree must be an object in {path}")
+    setup = worktree.get("setup", [])
+    if isinstance(setup, str):
+        setup = [setup] if setup.strip() else []
+    if not isinstance(setup, list) or any(not isinstance(command, str) for command in setup):
+        raise SetupError(f"worktree.setup must be a command string or list in {path}")
+    if WORKTREE_SETUP_COMMAND in setup:
+        say(f"{path} already runs {WORKTREE_SETUP_COMMAND} for new worktrees.")
+        return 0
+    # First, so later commands see the tree Paseo's agents will work on.
+    worktree["setup"] = [WORKTREE_SETUP_COMMAND, *setup] if setup else WORKTREE_SETUP_COMMAND
+    config["worktree"] = worktree
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    atomic_write(path, json.dumps(config, indent=2) + "\n", mode=mode)
+    say(f"Registered {WORKTREE_SETUP_COMMAND} in {path}. Commit it on the default branch: Paseo reads "
+        f"{PASEO_PROJECT_CONFIG} from the base branch when it creates a worktree.")
+    if shutil.which(WORKTREE_SETUP_COMMAND) is None:
+        say(f"{WORKTREE_SETUP_COMMAND} is not on PATH; make sure the Paseo daemon starts with the installer's "
+            "bin directory on PATH (rerun install.sh, which restarts it that way).")
+    return 0
+
+
+def worktree_setup(args):
+    """Entry point of the paseo-codex-worktree-setup launcher."""
+    parser = argparse.ArgumentParser(
+        prog=WORKTREE_SETUP_COMMAND,
+        description="Paseo worktree setup: fetch origin and start the worktree from the latest base branch. "
+                    "Run by paseo.json's worktree.setup; `init` registers it in a repository.")
+    sub = parser.add_subparsers(dest="action")
+    sub.add_parser("run", help="Prepare the worktree in $PASEO_WORKTREE_PATH or the current directory (default)")
+    init = sub.add_parser("init", help=f"Add the command to a repository's {PASEO_PROJECT_CONFIG}")
+    init.add_argument("repo", nargs="?", default=".", help="Repository root (default: current directory)")
+    opts = parser.parse_args(args)
+    if opts.action == "init":
+        return register_worktree_setup(opts.repo)
+    return prepare_worktree(os.environ.get("PASEO_WORKTREE_PATH") or os.getcwd())
+
+
 def main():
     if len(sys.argv) < 3:
         raise SetupError("Run install.sh first, then use the installed launchers")
@@ -894,6 +1071,8 @@ def main():
         launch_peppy(settings, args)
     elif mode == "proxy":
         control(settings, args)
+    elif mode == "worktree-setup":
+        sys.exit(worktree_setup(args))
     else:
         raise SetupError(f"Unknown launcher mode: {mode}")
 

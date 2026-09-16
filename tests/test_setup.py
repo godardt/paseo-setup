@@ -429,6 +429,42 @@ class InstallTests(unittest.TestCase):
     def test_installer_failure_releases_lock_for_waiting_installer(self):
         self.concurrent_installers(fail_first=True)
 
+    def test_paseo_pull_request_policy_is_kept_current_and_optional(self):
+        config_file = self.base / "paseo-policy.json"
+        stale = f"{install.PR_POLICY_START}\nold policy text\n{install.PR_POLICY_END}"
+        runtime.write_json(config_file, {"version": 1, "daemon": {
+            "appendSystemPrompt": f"House rules first.\n\n{stale}\n\nHouse rules last."}})
+        self.settings["peppy_config_dir"] = str(self.base / "claude-peppy")
+        with patch.object(install, "say"):
+            install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
+        prompt = runtime.read_json(config_file)["daemon"]["appendSystemPrompt"]
+        # Text around the block is preserved; the stale block is replaced by the current policy once.
+        self.assertEqual(prompt, f"House rules first.\n\n{install.PR_POLICY}\n\nHouse rules last.")
+        self.assertEqual(prompt.count(install.PR_POLICY_START), 1)
+        self.assertIn("gh pr create", prompt)
+        self.assertIn("refs/remotes/origin/HEAD", prompt)
+        # A rerun is a no-op (no backup written); a user prompt without the block gets it appended.
+        with patch.object(install, "backup") as backup, patch.object(install, "say"):
+            install.merge_paseo(config_file, self.settings, {"paseo_config": str(config_file)}, include_peppy=True)
+        backup.assert_not_called()
+        runtime.write_json(config_file, {"version": 1, "daemon": {"appendSystemPrompt": "Only mine."}})
+        with patch.object(install, "say"):
+            install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
+        self.assertEqual(runtime.read_json(config_file)["daemon"]["appendSystemPrompt"],
+                         f"Only mine.\n\n{install.PR_POLICY}")
+        # Opting out leaves the prompt exactly as found, and never creates a daemon section.
+        runtime.write_json(config_file, {"version": 1, "daemon": {"appendSystemPrompt": "Only mine."}})
+        with patch.object(install, "say"):
+            install.merge_paseo(config_file, self.settings, {}, include_peppy=True, pull_requests=False)
+        self.assertEqual(runtime.read_json(config_file)["daemon"], {"appendSystemPrompt": "Only mine."})
+        runtime.write_json(config_file, {"version": 1})
+        with patch.object(install, "say"):
+            install.merge_paseo(config_file, self.settings, {}, include_peppy=True, pull_requests=False)
+        self.assertNotIn("daemon", runtime.read_json(config_file))
+        runtime.write_json(config_file, {"version": 1, "daemon": "bad"})
+        with self.assertRaises(runtime.SetupError):
+            install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
+
     def test_paseo_merge_preserves_config_and_is_idempotent(self):
         config_file = self.base / "paseo.json"
         original = {"version": 1, "daemon": {"port": 6768}, "pluginsEnabled": False, "plugins": {
@@ -440,7 +476,8 @@ class InstallTests(unittest.TestCase):
         self.settings["peppy_config_dir"] = str(self.base / "claude-peppy")
         install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
         actual = runtime.read_json(config_file)
-        self.assertEqual(actual["daemon"], original["daemon"])
+        # Daemon settings are kept; only the pull request policy is appended.
+        self.assertEqual(actual["daemon"], {**original["daemon"], "appendSystemPrompt": install.PR_POLICY})
         # The plugin is registered from the data directory; other plugins and
         # settings are preserved, and the global switch is turned on.
         self.assertIs(actual["pluginsEnabled"], True)
@@ -673,6 +710,7 @@ class InstallTests(unittest.TestCase):
         run.assert_not_called()
         self.assertFalse((self.base / "absent-paseo").exists())
         self.assertFalse((Path(self.settings["bin_dir"]) / "paseo-codex").exists())
+        self.assertFalse((Path(self.settings["bin_dir"]) / install.WORKTREE_SETUP_COMMAND).exists())
         self.assertFalse((Path(self.settings["data_dir"]) / "npm" / "paseo").exists())
 
     def test_installer_reuses_system_paseo_over_saved_private_copy(self):
@@ -694,6 +732,11 @@ class InstallTests(unittest.TestCase):
         def check_activation(command, **kwargs):
             self.assertEqual(install.legacy_agent_module(system_paseo).read_text(), self.UPSTREAM_MODULE)
             self.assertTrue((Path(self.settings["data_dir"]) / "paseo-plugin" / "index.server.ts").is_file())
+            # The daemon inherits this environment and must find the worktree
+            # setup launcher named in paseo.json.
+            self.assertTrue(kwargs["env"]["PATH"].startswith(self.settings["bin_dir"] + os.pathsep))
+            self.assertEqual(kwargs["env"]["PATH"].split(os.pathsep).count(self.settings["bin_dir"]), 1)
+            self.assertIn(str(self.base), kwargs["env"]["PATH"].split(os.pathsep))
             return subprocess.CompletedProcess(command, 0)
         with patch.dict(os.environ, {"PATH": test_path}), \
              patch.object(install.subprocess, "run", side_effect=check_activation) as run:
@@ -707,6 +750,13 @@ class InstallTests(unittest.TestCase):
         wrapper = Path(self.settings["bin_dir"]) / "paseo-codex"
         result = subprocess.run([str(wrapper), "--version"], check=True, capture_output=True, text=True)
         self.assertEqual(result.stdout.strip(), "paseo on PATH")
+        setup = Path(self.settings["bin_dir"]) / install.WORKTREE_SETUP_COMMAND
+        self.assertIn(" worktree-setup ", setup.read_text())
+        self.assertTrue(install.launcher_is_owned(setup))
+        result = subprocess.run([str(setup), "--help"], check=True, capture_output=True, text=True)
+        self.assertIn("init", result.stdout)
+        self.assertEqual(runtime.read_json(self.base / "paseo-home" / "config.json")["daemon"]["appendSystemPrompt"],
+                         install.PR_POLICY)
 
     def test_explicit_paseo_is_used_without_version_checks(self):
         custom = self.fake_cli("paseo-custom", "print('custom paseo')\n")
@@ -868,6 +918,12 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(os.path.samefile(server["command"], shutil.which("python3")))
         self.assertEqual(server["args"], [str(data / "plane_mcp.py"), "--credentials", str(credentials)])
         self.assertEqual((data / "plane_mcp.py").read_bytes(), (ROOT / "scripts" / "plane_mcp.py").read_bytes())
+        # The Paseo plugin carries the same definition, so Paseo's own Claude
+        # provider gets the connector too, not only the launcher-based ones.
+        connector = data / "paseo-plugin" / install.PLUGIN_CONNECTOR_FILE
+        self.assertEqual(connector.read_text(), install.plane_connector_module(config / "plane-mcp.json"))
+        self.assertIn(json.dumps(server["args"][0]), connector.read_text())
+        self.assertNotIn(first_token, connector.read_text())
         for path in (credentials, config / "plane-mcp.json", data / "plane_mcp.py"):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         for path in (config / "settings.json", config / "plane-mcp.json",
