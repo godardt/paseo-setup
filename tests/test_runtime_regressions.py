@@ -552,6 +552,41 @@ class PaseoTranscriptTests(unittest.TestCase):
             self.assertFalse((source / f"{self.SESSION}.jsonl").exists())
 
 
+class DoctorCatalogTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="claude-codex-doctor-test-")
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name)
+        (base / "config" / "auth").mkdir(parents=True)
+        (base / "state").mkdir()
+        self.runtime = runtime.Runtime({"config_dir": str(base / "config"), "state_dir": str(base / "state"),
+                                        "proxy_bin": "/unused/proxy", "port": 1, "api_key": "k", "reasoning": "high"})
+        runtime.write_json(base / "config" / "auth" / "account.json", {"type": "codex", "refresh_token": "t"})
+        for name in ("start", "say"):
+            patcher = patch.object(runtime if name == "say" else self.runtime, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_doctor_waits_for_the_catalog_to_finish_loading(self):
+        # CLIProxyAPI answers /v1/models before its auth clients and remote model
+        # catalog are loaded, so the first responses after start can omit Astra.
+        catalogs = iter([{"data": []}, {"data": [{"id": "gpt-5.5"}]},
+                         {"data": [{"id": "gpt-5.5"}, {"id": runtime.MODEL}]}])
+        with patch.object(self.runtime, "request", side_effect=lambda path, payload=None, timeout=3: next(catalogs)) as request, \
+             patch.object(runtime.time, "sleep") as sleep:
+            self.runtime.doctor()
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_doctor_gives_up_when_the_model_never_appears(self):
+        clock = iter(range(0, 100, 5))
+        with patch.object(self.runtime, "request", return_value={"data": [{"id": "gpt-5.5"}]}), \
+             patch.object(runtime.time, "sleep"), \
+             patch.object(runtime.time, "monotonic", side_effect=lambda: float(next(clock))), \
+             self.assertRaisesRegex(runtime.SetupError, "does not advertise"):
+            self.runtime.doctor()
+
+
 class LoginTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="claude-codex-login-test-")

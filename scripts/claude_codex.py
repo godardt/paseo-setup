@@ -589,12 +589,23 @@ class Runtime:
         for path in (self.config_dir / "auth").glob("*.json"):
             path.chmod(0o600)
 
+    def advertises(self, model, timeout=20):
+        # A freshly started proxy answers /v1/models before its auth clients and
+        # remote model catalog have loaded, so the first catalog can be incomplete.
+        deadline = time.monotonic() + timeout
+        while True:
+            models = self.request("/v1/models")
+            if model in {item.get("id") for item in models.get("data", [])}:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
+
     def doctor(self, smoke=False):
         self.start()
         if not self.has_login():
             raise SetupError("ChatGPT login is missing. Run claude-codex-proxy login")
-        models = self.request("/v1/models")
-        if MODEL not in {item.get("id") for item in models["data"]}:
+        if not self.advertises(MODEL):
             raise SetupError(f"CLIProxyAPI does not advertise {MODEL}. Reauthenticate or update CLIProxyAPI.")
         say(f"Proxy ready at http://127.0.0.1:{self.settings['port']}; {MODEL} is in its catalog.")
         if smoke:
