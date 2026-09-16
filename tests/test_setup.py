@@ -1380,6 +1380,20 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(daemon, {"listen": "127.0.0.1:6767"})
         self.assertIn("Paseo daemon listen address unchanged: 127.0.0.1:6767", messages)
 
+    def test_reload_waits_for_restarted_daemon(self):
+        # A just-restarted daemon answers 503 until it finishes starting.
+        results = [subprocess.CompletedProcess([], 1, "", "Error: Unexpected server response: 503"),
+                   subprocess.CompletedProcess([], 0, "Configuration reloaded.", "")]
+        with patch.object(install.subprocess, "run", side_effect=results) as run, \
+             patch.object(install.time, "sleep"):
+            install.reload_paseo("paseo", {})
+        self.assertEqual(run.call_count, 2)
+        failed = subprocess.CompletedProcess([], 1, "", "Error: Unexpected server response: 503")
+        with patch.object(install.subprocess, "run", return_value=failed), \
+             patch.object(install.time, "sleep"), \
+             self.assertRaisesRegex(install.SetupError, "503"):
+            install.reload_paseo("paseo", {}, timeout=0)
+
     def test_install_configures_paseo_network_before_restarting(self):
         paseo = self.fake_paseo("paseo", "print('paseo')\n")
         paseo_config = self.base / "paseo-home" / "config.json"

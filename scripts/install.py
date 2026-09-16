@@ -579,6 +579,20 @@ def daemon_path(bin_dir, node_dir, current):
     return os.pathsep.join(entries)
 
 
+def reload_paseo(paseo_bin, env, timeout=90):
+    """Reload the restarted daemon, waiting while it still answers 503 during startup."""
+    deadline = time.monotonic() + timeout
+    while True:
+        result = subprocess.run([paseo_bin, "reload"], env=env, capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        if time.monotonic() >= deadline:
+            output = ((result.stderr or "") + (result.stdout or "")).strip()
+            raise SetupError(f"Paseo daemon did not accept a reload within {timeout}s; run paseo-codex reload once "
+                             f"it is up.\n{output}")
+        time.sleep(1)
+
+
 def configure_paseo_network(paseo_config, opts):
     """Make the daemon reachable from other devices on the network.
 
@@ -1239,7 +1253,7 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
         else:
             say(f"Restarting the local Paseo daemon with {paseo_bin}...")
             subprocess.run([paseo_bin, "daemon", "restart"], env=env, check=True)
-            subprocess.run([paseo_bin, "reload"], env=env, check=True)
+            reload_paseo(paseo_bin, env)
     step("Done")
     say(f"Installed: {bin_dir / 'claude-codex'}", "ok")
     if paseo_bin:
