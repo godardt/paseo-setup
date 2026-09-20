@@ -811,6 +811,7 @@ class InstallTests(unittest.TestCase):
         opts = install.parser().parse_args(self.staged_args("--skip-paseo"))
         config, data = Path(opts.config_dir), Path(opts.data_dir)
         with patch.object(install.sys.stdin, "isatty", return_value=True), \
+             patch.object(install.plane_mcp, "verify_api_key"), \
              patch.object(install, "masked_input", return_value="prompt-plane-token") as prompt:
             self.assertIsNone(install.prepare_plane(opts, {}, config, data, None))
             prompt.assert_not_called()
@@ -860,6 +861,81 @@ class InstallTests(unittest.TestCase):
             with self.assertRaises(runtime.SetupError):
                 install.prepare_plane(opts, previous, config, data, "")
             prompt.assert_not_called()
+
+    def plane_rejecting(self, *rejected):
+        """Accept every token but the named ones, which Plane refuses as it does a revoked token."""
+        def verify(api_key):
+            if api_key in rejected:
+                raise install.plane_mcp.AuthError("Plane authentication or access was rejected (HTTP 403).")
+        return patch.object(install.plane_mcp, "verify_api_key", side_effect=verify)
+
+    def test_plane_rejected_saved_token_is_replaced_rather_than_reused(self):
+        opts = install.parser().parse_args(self.staged_args("--skip-paseo"))
+        opts.skip_login = False
+        config, data = Path(opts.config_dir), Path(opts.data_dir)
+        previous = {"plane_mcp_config": str(config / "plane-mcp.json")}
+        credentials = config / "plane-credentials.json"
+        runtime.write_json(credentials, {"workspace": "peppy", "api_key": "revoked-plane-token"})
+        before = credentials.read_bytes()
+        with self.plane_rejecting("revoked-plane-token"), \
+             patch.object(install.sys.stdin, "isatty", return_value=True), \
+             patch.object(install, "masked_input", return_value="replacement-plane-token") as prompt, \
+             patch.object(install, "say") as say:
+            self.assertEqual(install.prepare_plane(opts, previous, config, data, None), "replacement-plane-token")
+            prompt.assert_called_once_with("Plane API token (masked with *; Enter to skip): ")
+        messages = [call.args[0] for call in say.call_args_list]
+        self.assertTrue(any("rejected the saved token" in message for message in messages))
+        self.assertFalse(any("plane-token" in message for message in messages))
+        # A rejected token is only replaced once the user supplies a working one.
+        with self.plane_rejecting("revoked-plane-token", "still-bad-token"), \
+             patch.object(install.sys.stdin, "isatty", return_value=True), \
+             patch.object(install, "masked_input", return_value="still-bad-token") as prompt, \
+             patch.object(install, "say"):
+            self.assertIsNone(install.prepare_plane(opts, previous, config, data, None))
+            self.assertEqual(prompt.call_count, install.PLANE_PROMPT_ATTEMPTS)
+        # Without a terminal there is nobody to ask, so the install explains and continues.
+        with self.plane_rejecting("revoked-plane-token"), \
+             patch.object(install.sys.stdin, "isatty", return_value=False), \
+             patch.object(install, "masked_input") as prompt, \
+             patch.object(install, "say") as say:
+            self.assertIsNone(install.prepare_plane(opts, previous, config, data, None))
+            prompt.assert_not_called()
+        self.assertTrue(any(install.PLANE_TOKEN_PAGE in call.args[0] for call in say.call_args_list))
+        self.assertEqual(credentials.read_bytes(), before)
+
+    def test_plane_rejected_supplied_token_stops_before_installation_changes(self):
+        opts = install.parser().parse_args(self.staged_args("--skip-paseo"))
+        opts.skip_login = False
+        config, data = Path(opts.config_dir), Path(opts.data_dir)
+        token_file = self.base / "rejected-token"
+        token_file.write_text("secret-rejected-token\n")
+        with self.plane_rejecting("secret-rejected-token"), \
+             patch.object(install, "masked_input") as prompt:
+            for source, environment_key in (("PLANE_API_KEY", "secret-rejected-token"), ("--plane-api-key-file", None)):
+                opts.plane_api_key_file = str(token_file) if environment_key is None else None
+                with self.subTest(source=source), self.assertRaises(runtime.SetupError) as raised:
+                    install.prepare_plane(opts, {}, config, data, environment_key)
+                self.assertIn(source, str(raised.exception))
+                self.assertIn(install.PLANE_TOKEN_PAGE, str(raised.exception))
+                self.assertNotIn("secret-rejected-token", str(raised.exception))
+            prompt.assert_not_called()
+        self.assertFalse((config / "plane-credentials.json").exists())
+
+    def test_plane_keeps_the_token_when_the_check_cannot_run(self):
+        opts = install.parser().parse_args(self.staged_args("--skip-paseo"))
+        config, data = Path(opts.config_dir), Path(opts.data_dir)
+        # A staged install stays entirely offline, so it never contacts Plane.
+        with patch.object(install.plane_mcp, "verify_api_key") as verify:
+            self.assertEqual(install.prepare_plane(opts, {}, config, data, "staged-token"), "staged-token")
+            verify.assert_not_called()
+        opts.skip_login = False
+        unreachable = install.plane_mcp.ToolError("Cannot connect to Plane.")
+        with patch.object(install.plane_mcp, "verify_api_key", side_effect=unreachable), \
+             patch.object(install, "say") as say:
+            self.assertEqual(install.prepare_plane(opts, {}, config, data, "offline-token"), "offline-token")
+        messages = [call.args[0] for call in say.call_args_list]
+        self.assertTrue(any("Cannot reach Plane" in message for message in messages))
+        self.assertFalse(any("offline-token" in message for message in messages))
 
     def test_plane_invalid_credentials_fail_before_installation_changes(self):
         opts = install.parser().parse_args(self.staged_args("--skip-paseo"))

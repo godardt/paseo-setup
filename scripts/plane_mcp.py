@@ -116,6 +116,10 @@ class ToolError(Exception):
     pass
 
 
+class AuthError(ToolError):
+    """Plane rejected the credential itself, rather than failing for another reason."""
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # Returning None lets urllib raise HTTPError without forwarding the API key.
@@ -139,7 +143,7 @@ def _http_error(status):
     if 300 <= status < 400:
         return ToolError("Plane redirects are not allowed.")
     if status in (401, 403):
-        return ToolError(f"Plane authentication or access was rejected (HTTP {status}).")
+        return AuthError(f"Plane authentication or access was rejected (HTTP {status}).")
     if status == 429:
         return ToolError("Plane rate limit reached (HTTP 429); retry later.")
     return ToolError(f"Plane request failed (HTTP {status}).")
@@ -273,6 +277,16 @@ class PlaneServer:
         except Exception:
             # Do not print tracebacks or remote response/credential details to either stream.
             return _error(message["id"], -32603, "Internal server error.")
+
+
+def verify_api_key(api_key):
+    """Make one minimal read-only call so a rejected token surfaces during setup.
+
+    Raises AuthError when Plane rejects the credential, and ToolError when the
+    check itself could not be completed (offline, timed out, or rate limited),
+    which says nothing about the token.
+    """
+    PlaneServer(api_key).call_tool("list_projects", {"per_page": 1})
 
 
 def _error(request_id, code, message):
