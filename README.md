@@ -141,7 +141,9 @@ Install on each daemon host. If an earlier version of this installer patched Pas
 
 ## Plane (read-only)
 
-Create a token at [Plane's API tokens page](https://app.plane.so/settings/profile/api-tokens). The installer stores it in a `0600` file and registers a GET-only MCP server, `claude-codex-plane-peppy-readonly`, exposing `list_projects`, `list_work_items`, and `get_work_item` for the `peppy` workspace. Mutations, redirects, and arbitrary paths are rejected in code. The token itself is not read-only; use a least-privilege account.
+Create a token at [Plane's API tokens page](https://app.plane.so/settings/profile/api-tokens). The installer stores it in a `0600` file and registers a GET-only MCP server, `plane-peppy-readonly`, exposing `list_projects`, `list_work_items`, and `get_work_item` for the `peppy` workspace. Mutations, redirects, and arbitrary paths are rejected in code. The token itself is not read-only; use a least-privilege account.
+
+Its name is the key the launchers and the plugin merge into a session's MCP servers, so a server you configure yourself under that name takes precedence and the connector is left out.
 
 Terminal `claude-codex` and `claude-peppy` sessions receive it through `--mcp-config`. Paseo agents receive it from the plugin, which adds the server to every new agent of the `claude`, `claude-codex`, and `claude-peppy` providers (Paseo's built-in provider never runs the launchers). Agents created before the plugin was installed keep their old server list; start a new agent.
 

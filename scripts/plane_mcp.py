@@ -14,7 +14,7 @@ import urllib.request
 
 from claude_codex import SetupError, say
 
-SERVER_NAME = "claude-codex-plane-peppy-readonly"
+SERVER_NAME = "plane-peppy-readonly"
 BASE_URL = "https://api.plane.so/api/v1/workspaces/peppy/"
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 HTTP_TIMEOUT = 15
