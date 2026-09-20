@@ -281,6 +281,29 @@ class ToolTests(OfflineTests):
                 self.assertEqual(stream.read_sizes, [])
                 self.assertTrue(stream.closed)
 
+    def test_verification_is_one_bounded_read_that_names_a_rejected_credential(self):
+        stream = self.reply({"results": [], "total_results": 0})
+        self.assertIsNone(plane.verify_api_key(SECRET))
+        self.transport.assert_called_once()
+        req = self.transport.call_args.args[1]
+        self.assertEqual(req.full_url, plane.BASE_URL + "projects/?per_page=1")
+        self.assertEqual(req.get_method(), "GET")
+        self.assertTrue(stream.closed)
+        # Only a rejected credential is an AuthError; anything else leaves the token unjudged.
+        for status, credential in ((401, True), (403, True), (404, False), (429, False), (500, False)):
+            with self.subTest(status=status):
+                self.reply(("Remote body " + SECRET).encode(), status)
+                with self.assertRaises(plane.ToolError) as error:
+                    plane.verify_api_key(SECRET)
+                self.assertIs(isinstance(error.exception, plane.AuthError), credential)
+                self.assertNotIn(SECRET, str(error.exception))
+                self.assertNotIn("Remote", str(error.exception))
+        self.transport.side_effect = urllib.error.URLError(SECRET)
+        with self.assertRaises(plane.ToolError) as error:
+            plane.verify_api_key(SECRET)
+        self.assertNotIsInstance(error.exception, plane.AuthError)
+        self.assertNotIn(SECRET, str(error.exception))
+
     def test_network_failures_and_timeouts_are_redacted(self):
         ready(self.server)
         errors = [TimeoutError(SECRET), urllib.error.URLError(TimeoutError(SECRET)),

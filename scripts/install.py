@@ -94,6 +94,8 @@ PLUGIN_FILES = ("paseo-plugin.json", "index.server.ts", "package.json")
 # Generated from the installed Plane MCP configuration rather than copied, so
 # the plugin can add the connector to every Claude Code agent Paseo creates.
 PLUGIN_CONNECTOR_FILE = "server/plane-connector.ts"
+PLANE_TOKEN_PAGE = "https://app.plane.so/settings/profile/api-tokens"
+PLANE_PROMPT_ATTEMPTS = 3
 # Earlier versions of this installer patched this module inside the selected
 # Paseo package. That is no longer done or undone here; a module still carrying
 # the marker is only reported.
@@ -697,8 +699,60 @@ def masked_input(prompt):
         sys.stderr.flush()
 
 
+def plane_key_rejected(api_key, check=True):
+    """True only when Plane itself rejects the token.
+
+    A staged install (--skip-login) never asks, and an unreachable or rate
+    limited Plane says nothing about the token, so neither counts as a
+    rejection: an offline install must still be able to carry a good token.
+    """
+    if not check:
+        return False
+    try:
+        plane_mcp.verify_api_key(api_key)
+    except plane_mcp.AuthError:
+        return True
+    except plane_mcp.ToolError as exc:
+        say(f"Cannot reach Plane to check the token ({exc}); keeping it as provided.", "warn")
+    return False
+
+
+def checked_plane_key(api_key, source, check=True):
+    """Fail an explicitly supplied token here rather than on every later read."""
+    if plane_key_rejected(api_key, check):
+        raise SetupError(f"Plane rejected the token from {source}; create a new one at "
+                         f"{PLANE_TOKEN_PAGE}, or rerun with --skip-plane to leave Plane alone")
+    return api_key
+
+
+def prompt_plane_key(check=True):
+    """Ask for a token until Plane accepts one, the user skips, or the attempts run out."""
+    say("Optional read-only Plane connection: https://app.plane.so/peppy/")
+    say(f"Create a token at {PLANE_TOKEN_PAGE} (Add personal access token).")
+    say("Use a least-privilege account. Only this connector is read-only; the token itself may have write permissions.")
+    say("The token stays in private local storage.")
+    for _ in range(PLANE_PROMPT_ATTEMPTS):
+        try:
+            value = masked_input("Plane API token (masked with *; Enter to skip): ")
+        except (EOFError, OSError, ValueError, termios.error):
+            raise SetupError("Cannot read a masked Plane token; use --plane-api-key-file or --skip-plane") from None
+        if not value.strip():
+            return None
+        try:
+            api_key = plane_mcp.validate_api_key(value)
+        except SetupError as exc:
+            # Never echoes the token itself, so it is safe to reprompt instead of aborting.
+            say(str(exc), "warn")
+            continue
+        if not plane_key_rejected(api_key, check):
+            return api_key
+        say("Plane rejected that token; check that it was copied whole and has not been revoked.", "warn")
+    say(f"No accepted token after {PLANE_PROMPT_ATTEMPTS} attempts; continuing without a new Plane token.", "warn")
+    return None
+
+
 def prepare_plane(opts, previous, config_dir, data_dir, environment_key):
-    """Select credentials without writing files or contacting Plane."""
+    """Select credentials, checking them against Plane before anything is written."""
     if opts.skip_plane:
         return None
     credentials = config_dir / "plane-credentials.json"
@@ -712,29 +766,31 @@ def prepare_plane(opts, previous, config_dir, data_dir, environment_key):
         if path.is_symlink() or (path.exists() and not owned):
             raise SetupError(f"Refusing to overwrite an unrelated or symlinked Plane setup file: {path}")
     saved_key = plane_mcp.load_credentials(credentials) if configured and credentials.exists() else None
+    # A staged install neither authenticates nor prompts, so it cannot check a token either.
+    check = not opts.skip_login
     if opts.plane_api_key_file:
         try:
             value = absolute(opts.plane_api_key_file).read_text()
         except (OSError, UnicodeError):
             raise SetupError("Cannot read --plane-api-key-file; provide a UTF-8 file containing only the token") from None
-        return plane_mcp.validate_api_key(value)
+        return checked_plane_key(plane_mcp.validate_api_key(value), "--plane-api-key-file", check)
     if environment_key is not None:
-        return plane_mcp.validate_api_key(environment_key)
+        return checked_plane_key(plane_mcp.validate_api_key(environment_key), "PLANE_API_KEY", check)
     if configured:
         if saved_key is None:
             raise SetupError("Saved Plane credentials are missing; provide --plane-api-key-file or use --skip-plane")
-        return saved_key
+        if not plane_key_rejected(saved_key, check):
+            return saved_key
+        # Reusing it silently is what leaves a rotated token failing on every read.
+        say("Plane rejected the saved token; it was revoked, expired, or belongs to another account.", "warn")
+        if not sys.stdin.isatty():
+            say(f"Create a new token at {PLANE_TOKEN_PAGE}, then rerun the installer interactively or with "
+                "--plane-api-key-file. The saved token stays in place and Plane reads keep failing.", "warn")
+            return None
+        return prompt_plane_key(check)
     if opts.skip_login or not sys.stdin.isatty():
         return None
-    say("Optional read-only Plane connection: https://app.plane.so/peppy/")
-    say("Create a token at https://app.plane.so/settings/profile/api-tokens (Add personal access token).")
-    say("Use a least-privilege account. Only this connector is read-only; the token itself may have write permissions.")
-    say("The token stays in private local storage.")
-    try:
-        value = masked_input("Plane API token (masked with *; Enter to skip): ")
-    except (EOFError, OSError, ValueError, termios.error):
-        raise SetupError("Cannot read a masked Plane token; use --plane-api-key-file or --skip-plane") from None
-    return plane_mcp.validate_api_key(value) if value.strip() else None
+    return prompt_plane_key(check)
 
 
 def validate_oauth_token(value):
@@ -1145,8 +1201,7 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
     step("Plane read-only connection")
     plane_key = prepare_plane(opts, previous, config_dir, data_dir, plane_environment_key)
     if plane_key is not None:
-        say("Plane read-only connector for peppy: configured with this installation; authentication is checked "
-            "on the first read.", "ok")
+        say("Plane read-only connector for peppy: configured with this installation.", "ok")
     elif previous.get("plane_mcp_config"):
         say("Plane setup skipped; the existing connection and credentials are retained.")
     else:
