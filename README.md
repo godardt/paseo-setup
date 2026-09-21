@@ -25,7 +25,7 @@ The installer is a Python standard-library script. It never modifies your `claud
 - **`claude-peppy`** — a second, regular Claude Code account in `~/.claude-peppy`. No proxy.
 - **`paseo-codex`** (Paseo only) — your Paseo executable with the configured `PASEO_HOME`.
 - **`paseo-codex-worktree-setup`** (Paseo only) — worktree setup command for `paseo.json`: new worktrees start from the latest default branch on `origin`.
-- **Paseo plugin** `claude-codex` (Paseo 0.8+) — adds the Plane connector to every Claude Code agent and keeps Claude Codex agents out of auto mode via the `agent.create` hook.
+- **Paseo plugin** `claude-codex` (Paseo 0.8+) — adds the Plane connector to every Claude Code and Codex agent and keeps Claude Codex agents out of auto mode via the `agent.create` hook.
 
 ## Requirements
 
@@ -112,7 +112,7 @@ Providers added to `config.json`:
 
 Both run in the **daemon's Claude profile** (its `CLAUDE_CONFIG_DIR` or `~/.claude`), because Paseo reloads transcripts from there. Conversations survive restarts; the daemon profile's settings, hooks, and plugins apply.
 
-The plugin adds the Plane connector (below) to every agent of the `claude`, `claude-codex`, and `claude-peppy` providers, and rewrites an explicit Auto-mode request for the Claude Codex provider to Always Ask. To keep auto mode, add `"CLAUDE_CODEX_AUTO_MODE": "1"` to the provider's `env` and run `paseo-codex plugin disable claude-codex`.
+The plugin adds the Plane connector (below) to every agent of the `claude`, `claude-codex`, `claude-peppy`, and `codex` providers, and rewrites an explicit Auto-mode request for the Claude Codex provider to Always Ask. To keep auto mode, add `"CLAUDE_CODEX_AUTO_MODE": "1"` to the provider's `env` and run `paseo-codex plugin disable claude-codex`.
 
 ### Worktrees and pull requests
 
@@ -145,7 +145,7 @@ Create a token at [Plane's API tokens page](https://app.plane.so/settings/profil
 
 Its name is the key the launchers and the plugin merge into a session's MCP servers, so a server you configure yourself under that name takes precedence and the connector is left out.
 
-Terminal `claude-codex` and `claude-peppy` sessions receive it through `--mcp-config`. Paseo agents receive it from the plugin, which adds the server to every new agent of the `claude`, `claude-codex`, and `claude-peppy` providers (Paseo's built-in provider never runs the launchers). Agents created before the plugin was installed keep their old server list; start a new agent.
+Terminal `claude-codex` and `claude-peppy` sessions receive it through `--mcp-config`. Paseo agents receive it from the plugin, which adds the server to every new agent of the `claude`, `claude-codex`, `claude-peppy`, and `codex` providers (Paseo's built-in Claude and Codex providers never run the launchers). Agents created before the plugin was installed keep their old server list; start a new agent.
 
 The installer checks the token with one read-only call before writing anything. A token it supplies (`--plane-api-key-file`, `PLANE_API_KEY`) that Plane rejects fails the install; a saved token that Plane rejects is reported and replaced by prompt, so rerunning `install.sh` is how you rotate a revoked or expired one. When Plane is unreachable the token is kept as provided, and `--skip-login` stages the install without contacting Plane at all.
 

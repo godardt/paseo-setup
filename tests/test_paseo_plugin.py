@@ -164,7 +164,8 @@ const out = {
   unset: run({ provider: "claude-codex", cwd: "/w" }),
   peppy: run({ provider: "claude-peppy", cwd: "/w", modeId: "auto" }),
   claude: run({ provider: "claude", cwd: "/w", modeId: "auto" }),
-  other: run({ provider: "codex", cwd: "/w", modeId: "auto" }),
+  codex: run({ provider: "codex", cwd: "/w", modeId: "auto" }),
+  other: run({ provider: "opencode", cwd: "/w", modeId: "auto" }),
   present: run({ provider: "claude", cwd: "/w", mcpServers: { [process.argv[2]]: { type: "http", url: "https://example.invalid/mcp" } } }),
   merged: run({ provider: "claude", cwd: "/w", mcpServers: { own: { type: "http", url: "https://example.invalid/own" } } }),
 };
@@ -186,10 +187,10 @@ console.log(JSON.stringify(out));
         self.assertEqual(out["auto"], {"config": {"provider": "claude-codex", "cwd": "/w", "modeId": "default",
                                                   "model": "gpt-6-astra(high)"}, "env": {"KEEP": "1"}})
         # Other modes, inherited modes, and other providers pass through untouched.
-        for key in ("bypass", "unset", "peppy", "claude", "other", "present", "merged"):
+        for key in ("bypass", "unset", "peppy", "claude", "codex", "other", "present", "merged"):
             self.assertIsNone(out[key], key)
 
-    def test_installed_connector_is_added_to_every_claude_code_provider(self):
+    def test_installed_connector_is_added_to_every_claude_code_and_codex_provider(self):
         with tempfile.TemporaryDirectory(prefix="claude-codex-plugin-") as temp:
             config = Path(temp) / "plane-mcp.json"
             server = {"type": "stdio", "command": "/usr/bin/python3",
@@ -210,8 +211,12 @@ console.log(JSON.stringify(out));
         self.assertEqual(out["unset"]["config"], {"provider": "claude-codex", "cwd": "/w", "mcpServers": connector})
         self.assertEqual(out["peppy"]["config"], {"provider": "claude-peppy", "cwd": "/w", "modeId": "auto",
                                                   "mcpServers": connector})
+        # Paseo's built-in Codex provider passes the servers to Codex; its mode
+        # is never rewritten, since only the gateway provider lacks auto mode.
+        self.assertEqual(out["codex"], {"config": {"provider": "codex", "cwd": "/w", "modeId": "auto",
+                                                   "mcpServers": connector}, "env": {"KEEP": "1"}})
         # A caller's servers are kept and extended; its own definition of the
-        # connector's name wins; non-Claude providers are never touched.
+        # connector's name wins; other providers are never touched.
         self.assertEqual(out["merged"]["config"]["mcpServers"],
                          {"own": {"type": "http", "url": "https://example.invalid/own"}, **connector})
         self.assertIsNone(out["present"])
@@ -230,7 +235,8 @@ const exports = factory((name) => { if (name === "@getpaseo/plugin/server") retu
 let handler;
 const cleanup = exports.default({ before(name, h) { handler = h; return () => {}; }, on() { return () => {}; } });
 const run = (config) => handler({ request: { config, env: {} } }, {}) ?? null;
-console.log(JSON.stringify({ claude: run({ provider: "claude", cwd: "/w" }), other: run({ provider: "codex", cwd: "/w" }) }));
+console.log(JSON.stringify({ claude: run({ provider: "claude", cwd: "/w" }), codex: run({ provider: "codex", cwd: "/w" }),
+                              other: run({ provider: "opencode", cwd: "/w" }) }));
 cleanup();
 """
 
@@ -247,6 +253,8 @@ cleanup();
         self.assertEqual(json.loads(result.stdout.splitlines()[-1]), {
             "claude": {"config": {"provider": "claude", "cwd": "/w", "mcpServers": {plane_mcp.SERVER_NAME: server}},
                        "env": {}},
+            "codex": {"config": {"provider": "codex", "cwd": "/w", "mcpServers": {plane_mcp.SERVER_NAME: server}},
+                      "env": {}},
             "other": None,
         })
 

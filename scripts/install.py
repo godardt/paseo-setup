@@ -92,7 +92,8 @@ def pull_request_policy(existing):
 PLUGIN_SOURCE = Path(__file__).with_name("paseo_plugin")
 PLUGIN_FILES = ("paseo-plugin.json", "index.server.ts", "package.json")
 # Generated from the installed Plane MCP configuration rather than copied, so
-# the plugin can add the connector to every Claude Code agent Paseo creates.
+# the plugin can add the connector to every Claude Code and Codex agent Paseo
+# creates.
 PLUGIN_CONNECTOR_FILE = "server/plane-connector.ts"
 PLANE_TOKEN_PAGE = "https://app.plane.so/settings/profile/api-tokens"
 PLANE_PROMPT_ATTEMPTS = 3
@@ -440,7 +441,7 @@ def install_plugin_files(data_dir, plane_mcp_config=None):
 
     The connector module is generated from the installed Plane configuration
     (empty when Plane is not configured) so the plugin can add the read-only
-    connector to every Claude Code agent Paseo creates.
+    connector to every Claude Code and Codex agent Paseo creates.
     """
     target = Path(data_dir) / "paseo-plugin"
     target.mkdir(parents=True, exist_ok=True)
