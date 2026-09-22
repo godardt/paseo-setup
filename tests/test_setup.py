@@ -129,6 +129,12 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(terminal["CLAUDE_CONFIG_DIR"], "/tmp/test config/claude")
 
 
+def relaunch_calls(paseo):
+    """The commands the installer runs to relaunch a daemon it does not find under systemd, then verify it."""
+    return [[paseo, "daemon", "status", "--json"], [paseo, "daemon", "stop", "--force"], [paseo, "daemon", "start"],
+            [paseo, "reload"], [paseo, "daemon", "status", "--json"]]
+
+
 class InstallTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="claude-codex-test-")
@@ -741,8 +747,7 @@ class InstallTests(unittest.TestCase):
         with patch.dict(os.environ, {"PATH": test_path}), \
              patch.object(install.subprocess, "run", side_effect=check_activation) as run:
             install.install(install.parser().parse_args(args))
-        self.assertEqual([call.args[0] for call in run.call_args_list],
-                         [[str(system_paseo), "daemon", "restart"], [str(system_paseo), "reload"]])
+        self.assertEqual([call.args[0] for call in run.call_args_list], relaunch_calls(str(system_paseo)))
         saved = runtime.read_json(Path(self.settings["config_dir"]) / "settings.json")
         self.assertEqual(saved["paseo_bin"], str(system_paseo))
         self.assertEqual(system_paseo.read_bytes(), original)
@@ -1095,8 +1100,7 @@ class InstallTests(unittest.TestCase):
         with patch.dict(os.environ, {"PLANE_API_KEY": "not-for-daemon"}), \
              patch.object(install.subprocess, "run", side_effect=run) as spawn:
             install.install(opts)
-        self.assertEqual([call.args[0] for call in spawn.call_args_list],
-                         [[str(paseo), "daemon", "restart"], [str(paseo), "reload"]])
+        self.assertEqual([call.args[0] for call in spawn.call_args_list], relaunch_calls(str(paseo)))
 
     def test_peppy_token_precedence_validation_and_prompt(self):
         opts = install.parser().parse_args(self.staged_args("--skip-paseo"))
@@ -1470,6 +1474,135 @@ class InstallTests(unittest.TestCase):
              self.assertRaisesRegex(install.SetupError, "503"):
             install.reload_paseo("paseo", {}, timeout=0)
 
+    def test_daemon_pid_and_version_come_from_the_paseo_cli(self):
+        def run(command, **kwargs):
+            outputs = {"status": '{"home": "/h", "pid": 4242, "localDaemon": "running"}\n', "--version": "0.9.0\n"}
+            return subprocess.CompletedProcess(command, 0, outputs.get(command[-2] if command[-1] == "--json" else command[-1], ""), "")
+        with patch.object(install.subprocess, "run", side_effect=run):
+            self.assertEqual(install.daemon_pid("paseo", {}), 4242)
+            self.assertEqual(install.paseo_version("paseo", {}), (0, 9, 0))
+        for stdout in ('{"pid": null, "localDaemon": "stopped"}', "Server ID  srv_x\nPID  12\n", "", None):
+            with patch.object(install.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout, "")):
+                self.assertIsNone(install.daemon_pid("paseo", {}), stdout)
+                self.assertIsNone(install.paseo_version("paseo", {}), stdout)
+        with patch.object(install.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, '{"pid": 7}', "")):
+            self.assertIsNone(install.daemon_pid("paseo", {}))
+
+    def test_systemd_service_is_read_from_the_cgroup(self):
+        user = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/paseo.service\n"
+        self.assertEqual(install.systemd_service(user), ("user", "paseo.service"))
+        self.assertEqual(install.systemd_service("12:cpu:/\n1:name=systemd:/system.slice/paseo.service\n"),
+                         ("system", "paseo.service"))
+        for unmanaged in ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/vte-spawn-1.scope\n",
+                          "0::/user.slice/user-1000.slice/session-3.scope\n",
+                          "0::/user.slice/user-1000.slice/user@1000.service\n", "0::/\n", ""):
+            self.assertIsNone(install.systemd_service(unmanaged), unmanaged)
+        self.assertEqual(install.process_cgroup(0), "")
+
+    def test_removed_launch_flags_are_found_in_exec_start(self):
+        shown = ('{ path=/bin/bash ; argv[]=/bin/bash -c . "$NVM_DIR/nvm.sh" && exec paseo daemon start --foreground'
+                 ' --port 6767 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n')
+        self.assertEqual(install.removed_launch_flags(shown), ["--foreground", "--port"])
+        self.assertEqual(install.removed_launch_flags(
+            "{ path=/usr/bin/paseo ; argv[]=paseo daemon run --home /srv/paseo ; ignore_errors=no }"), [])
+        self.assertEqual(install.removed_launch_flags("argv[]=paseo daemon start --timeout 60 --home /h ; x"), [])
+        self.assertEqual(install.removed_launch_flags("argv[]=paseo-wait-ready --port 1 ; argv[]=paseo daemon start ; x"), [])
+        self.assertEqual(install.removed_launch_flags(""), [])
+
+    def test_daemon_relaunch_goes_through_systemd_when_a_service_runs_it(self):
+        user_cgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/paseo.service\n"
+        compatible = "{ path=/bin/bash ; argv[]=/bin/bash -c exec paseo daemon run ; ignore_errors=no }\n"
+        legacy = "{ path=/bin/bash ; argv[]=/bin/bash -c exec paseo daemon start --foreground ; ignore_errors=no }\n"
+
+        def relaunch(cgroup, exec_start, version="0.9.0", pid=4242):
+            calls = []
+
+            def run(command, **kwargs):
+                calls.append(command)
+                if command[1:] == ["daemon", "status", "--json"]:
+                    return subprocess.CompletedProcess(command, 0, json.dumps({"pid": pid}), "")
+                if command[1:] == ["--version"]:
+                    return subprocess.CompletedProcess(command, 0, version + "\n", "")
+                if command[0] == "systemctl" and "show" in command:
+                    if exec_start is None:
+                        return subprocess.CompletedProcess(command, 1, "", "Failed to connect to bus\n")
+                    return subprocess.CompletedProcess(command, 0, exec_start, "")
+                return subprocess.CompletedProcess(command, 0, "", "")
+            with patch.object(install.subprocess, "run", side_effect=run), \
+                 patch.object(install, "process_cgroup", side_effect=lambda pid: cgroup), \
+                 patch.object(install, "say") as say:
+                restarted = install.restart_paseo_daemon("paseo", {"PATH": "/bin"})
+            return restarted, calls, [call.args[0] for call in say.call_args_list]
+
+        restarted, calls, _ = relaunch(user_cgroup, compatible)
+        self.assertTrue(restarted)
+        self.assertEqual(calls, [["paseo", "daemon", "status", "--json"], ["paseo", "--version"],
+                                 ["systemctl", "--user", "show", "--property=ExecStart", "--value", "paseo.service"],
+                                 ["systemctl", "--user", "restart", "paseo.service"]])
+        # A unit still passing a launch flag Paseo 0.9 removed would fail to start: warn, leave it running.
+        restarted, calls, messages = relaunch(user_cgroup, legacy)
+        self.assertFalse(restarted)
+        self.assertNotIn(["systemctl", "--user", "restart", "paseo.service"], calls)
+        self.assertTrue(any("--foreground" in message and "paseo daemon run" in message
+                            and "systemctl --user daemon-reload && systemctl --user restart paseo.service" in message
+                            for message in messages), messages)
+        # Paseo 0.8 still accepts the flag, so the unit is restarted as it is.
+        restarted, calls, _ = relaunch(user_cgroup, legacy, version="0.8.0")
+        self.assertTrue(restarted)
+        self.assertIn(["systemctl", "--user", "restart", "paseo.service"], calls)
+        self.assertFalse(any("show" in command for command in calls))
+        # A unit that cannot be inspected is not restarted blindly.
+        restarted, calls, messages = relaunch(user_cgroup, None)
+        self.assertFalse(restarted)
+        self.assertNotIn(["systemctl", "--user", "restart", "paseo.service"], calls)
+        self.assertTrue(any("Failed to connect to bus" in message and "systemctl --user restart paseo.service" in message
+                            for message in messages), messages)
+        # A failed restart is reported with the way forward.
+        with patch.object(install.subprocess, "run", side_effect=lambda command, **kwargs: subprocess.CompletedProcess(
+                command, 1 if command[0] == "systemctl" and "restart" in command else 0,
+                json.dumps({"pid": 4242}) if "status" in command else ("0.9.0\n" if "--version" in command else compatible), "")), \
+             patch.object(install, "process_cgroup", return_value=user_cgroup), patch.object(install, "say"), \
+             self.assertRaisesRegex(runtime.SetupError, "systemctl --user restart paseo.service failed"):
+            install.restart_paseo_daemon("paseo", {})
+        # A system service needs root; report the command instead.
+        restarted, calls, messages = relaunch("0::/system.slice/paseo.service\n", compatible)
+        self.assertFalse(restarted)
+        self.assertFalse(any(command[0] == "systemctl" and "restart" in command for command in calls))
+        self.assertTrue(any("sudo systemctl restart paseo.service" in message for message in messages), messages)
+        # Not under systemd: stop and start from this environment.
+        restarted, calls, _ = relaunch("0::/user.slice/user-1000.slice/session-3.scope\n", compatible)
+        self.assertTrue(restarted)
+        self.assertEqual(calls, [["paseo", "daemon", "status", "--json"], ["paseo", "daemon", "stop", "--force"],
+                                 ["paseo", "daemon", "start"]])
+        # Not running: the stop is a harmless no-op and no cgroup is consulted.
+        restarted, calls, _ = relaunch(AssertionError("no process to inspect"), legacy, pid=None)
+        self.assertTrue(restarted)
+        self.assertEqual(calls, [["paseo", "daemon", "status", "--json"], ["paseo", "daemon", "stop", "--force"],
+                                 ["paseo", "daemon", "start"]])
+
+    def test_daemon_path_check_warns_when_launchers_are_missing(self):
+        bin_dir = Path(self.settings["bin_dir"])
+        with patch.object(install, "daemon_pid", return_value=4242), patch.object(install, "say") as say, \
+             patch.object(install, "daemon_path_entries", return_value=["/usr/bin", str(bin_dir)]):
+            self.assertTrue(install.check_daemon_path("paseo", {}, bin_dir))
+            say.assert_not_called()
+        with patch.object(install, "daemon_pid", return_value=4242), patch.object(install, "say") as say, \
+             patch.object(install, "daemon_path_entries", return_value=["/usr/bin"]):
+            self.assertFalse(install.check_daemon_path("paseo", {}, bin_dir))
+            self.assertIn(str(bin_dir), say.call_args.args[0])
+            self.assertIn(install.WORKTREE_SETUP_COMMAND, say.call_args.args[0])
+        # Unreadable (another platform, or the process is gone) or no daemon: nothing to report.
+        with patch.object(install, "daemon_pid", return_value=4242), patch.object(install, "say") as say, \
+             patch.object(install, "daemon_path_entries", return_value=None):
+            self.assertTrue(install.check_daemon_path("paseo", {}, bin_dir))
+            say.assert_not_called()
+        with patch.object(install, "daemon_pid", return_value=None), patch.object(install, "say") as say:
+            self.assertTrue(install.check_daemon_path("paseo", {}, bin_dir))
+            say.assert_not_called()
+        self.assertIsNone(install.daemon_path_entries(0))
+        if sys.platform == "linux":
+            self.assertIn(os.environ["PATH"].split(os.pathsep)[0], install.daemon_path_entries(os.getpid()))
+
     def test_install_configures_paseo_network_before_restarting(self):
         paseo = self.fake_paseo("paseo", "print('paseo')\n")
         paseo_config = self.base / "paseo-home" / "config.json"
@@ -1490,7 +1623,7 @@ class InstallTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0)
         with patch.object(install.subprocess, "run", side_effect=restart), patch.object(install, "say"):
             install.install(opts)
-        self.assertEqual(seen, [(["daemon", "restart"], "0.0.0.0:6767"), (["reload"], "0.0.0.0:6767")])
+        self.assertEqual(seen, [(command[1:], "0.0.0.0:6767") for command in relaunch_calls("paseo")])
         # --paseo-listen keep leaves an existing listener alone.
         runtime.write_json(paseo_config, {"version": 1, "daemon": {"listen": "127.0.0.1:6767"}})
         install.install(install.parser().parse_args(self.staged_args("--paseo-bin", str(paseo), "--paseo-listen", "keep")))
@@ -1644,8 +1777,7 @@ class InstallTests(unittest.TestCase):
         with patch.dict(os.environ, {"CLAUDE_PEPPY_OAUTH_TOKEN": "sk-ant-oat01-not-for-daemon"}), \
              patch.object(install.subprocess, "run", side_effect=run) as spawn:
             install.install(opts)
-        self.assertEqual([call.args[0] for call in spawn.call_args_list],
-                         [[str(paseo), "daemon", "restart"], [str(paseo), "reload"]])
+        self.assertEqual([call.args[0] for call in spawn.call_args_list], relaunch_calls(str(paseo)))
 
     def test_peppy_launcher_under_paseo_uses_daemon_profile_and_saved_token(self):
         claude = self.fake_cli("claude-reporting", "import json,os,sys\n"
