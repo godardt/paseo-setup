@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""One-command, per-user installer. No sudo; the only global npm install is Paseo, and only on request."""
+"""One-command, per-user installer. The only global npm install is Paseo, and the only sudo is for a Paseo
+system service (restarting it, or repairing one Paseo 0.9 broke), each only on request."""
 
 import argparse
 import fcntl
@@ -9,6 +10,7 @@ import os
 from pathlib import Path
 import platform
 import pty
+import pwd
 import re
 import secrets
 import select
@@ -599,11 +601,36 @@ def reload_paseo(paseo_bin, env, timeout=90):
 # Since Paseo 0.9, `paseo daemon restart` only replaces the daemon's worker:
 # the supervisor keeps the package and environment it was launched with, and a
 # stopped daemon is not started. These launch flags were removed at the same
-# time (settings moved to config.json); a service unit still passing one to
-# `paseo daemon start` fails on its next start.
+# time (settings moved to config.json); a service unit still passing one fails
+# every start. Each maps to the environment override `paseo daemon run` reads
+# in its place ({} when none is needed), or to None for a setting that now
+# lives only in config.json. `paseo daemon start` ignores these overrides.
 PASEO_WORKER_RESTART = (0, 9, 0)
-REMOVED_LAUNCH_FLAGS = ("--foreground", "--listen", "--port", "--relay", "--no-relay", "--relay-use-tls",
-                        "--no-mcp", "--no-inject-mcp", "--web-ui", "--no-web-ui", "--hostnames", "--allowed-hosts")
+REMOVED_VALUE_FLAGS = {"--listen": "PASEO_LISTEN", "--port": None, "--hostnames": None, "--allowed-hosts": None}
+REMOVED_SWITCHES = {
+    "--foreground": {}, "--relay": {"PASEO_RELAY_ENABLED": "true"}, "--no-relay": {"PASEO_RELAY_ENABLED": "false"},
+    "--relay-use-tls": {"PASEO_RELAY_USE_TLS": "true"}, "--web-ui": {"PASEO_WEB_UI_ENABLED": "true"},
+    "--no-web-ui": {"PASEO_WEB_UI_ENABLED": "false"}, "--no-mcp": None, "--no-inject-mcp": None,
+}
+REMOVED_LAUNCH_FLAGS = (*REMOVED_VALUE_FLAGS, *REMOVED_SWITCHES)
+# A daemon launch in a service's ExecStart, directly or inside a shell command:
+# `paseo daemon start|run|restart` or the top-level `paseo start|restart`
+# aliases (`paseo run` starts an agent), with its arguments up to the end of
+# that command.
+PASEO_LAUNCH = re.compile(r"(?<![\w.-])paseo(?:-codex)?(?P<command>(?:\s+--home(?:=|\s+)[^\s;&|\"'`]+)?"
+                          r"\s+(?:daemon\s+(?:start|run|restart)|start|restart))\b(?P<args>[^;&|\"'`\n]*)")
+# A removed flag's value that can be carried into an Environment= line as is.
+LAUNCH_VALUE = re.compile(r"[\w.:/%@\[\]-]+")
+# Sorted after other drop-ins, `systemctl edit`'s override.conf included, so
+# its ExecStart is the one that applies.
+SERVICE_DROP_IN = "zz-claude-codex.conf"
+SERVICE_PROPERTIES = ("Id", "ExecStart", "Environment", "User", "ActiveState", "UnitFileState", "FragmentPath",
+                      "DropInPaths")
+# A service in one of these unit file states starts at boot (or login); one in
+# a running state runs, or keeps retrying, now.
+STARTED_UNIT_STATES = ("enabled", "enabled-runtime", "linked", "linked-runtime", "alias", "indirect", "generated",
+                       "transient")
+RUNNING_STATES = ("active", "activating", "reloading")
 
 
 def paseo_version(paseo_bin, env):
@@ -645,64 +672,212 @@ def systemd_service(cgroup):
 
 
 def removed_launch_flags(exec_start):
-    """Removed launch flags a service's ExecStart still passes to paseo daemon."""
+    """Removed launch flags a service's ExecStart still passes to a paseo daemon launch."""
     found = []
-    for launch in re.finditer(r"\bdaemon\s+(?:start|run|restart)\b([^;]*)", exec_start):
-        for flag in re.findall(r"(?<![\w-])--[\w-]+", launch.group(1)):
+    for launch in PASEO_LAUNCH.finditer(exec_start):
+        for flag in re.findall(r"(?<![\w-])--[\w-]+", launch["args"]):
             if flag in REMOVED_LAUNCH_FLAGS and flag not in found:
                 found.append(flag)
     return found
 
 
-def restart_systemd_service(service, paseo_bin, env):
-    """Restart a daemon that a systemd service runs, through systemd; False when left running."""
-    scope, unit = service
-    control = ["systemctl", "--user"] if scope == "user" else ["systemctl"]
-    manager = " ".join(control)
-    version = paseo_version(paseo_bin, env)
-    removed = []
-    if version is None or version >= PASEO_WORKER_RESTART:
-        shown = subprocess.run([*control, "show", "--property=ExecStart", "--value", unit],
-                               capture_output=True, text=True)
-        if shown.returncode != 0 or not (shown.stdout or "").strip():
-            # Without the unit's launch command, a restart could stop a daemon
-            # that no longer starts; leave it to the user.
-            say(f"The Paseo daemon is run by systemd service {unit}, but its unit could not be inspected "
-                f"({(shown.stderr or '').strip() or f'exit {shown.returncode}'}); the daemon was left running. "
-                f"Restart it yourself: {manager} restart {unit}", "warn")
-            return False
-        removed = removed_launch_flags(shown.stdout)
-    if removed:
-        say(f"The Paseo daemon is run by systemd service {unit}, whose ExecStart still passes {' '.join(removed)} "
-            "to paseo daemon. Paseo 0.9 removed these launch flags, so the service will fail the next time it "
-            "starts; the daemon was left running as it is. Edit the unit to run `paseo daemon run` (settings now "
-            f"live in config.json; see paseo daemon config), then: {manager} daemon-reload && {manager} restart {unit}",
-            "warn")
-        return False
-    if scope == "system":
-        say(f"The Paseo daemon is run by system service {unit}; restart it to apply the configuration: "
-            f"sudo systemctl restart {unit}", "warn")
-        return False
-    say(f"Restarting the Paseo daemon through systemd user service {unit}...")
-    if subprocess.run([*control, "restart", unit]).returncode != 0:
-        raise SetupError(f"{manager} restart {unit} failed; check {manager} status {unit}, then run "
-                         "paseo-codex reload once the daemon is up")
-    return True
+def rewrite_launch(exec_start):
+    """(ExecStart, environment) launching the same daemon on Paseo 0.9, or None when that cannot be done.
 
-
-def restart_paseo_daemon(paseo_bin, env):
-    """Relaunch the local daemon so it runs the installed Paseo with this environment.
-
-    Stopping and starting relaunches supervisor and worker from the current
-    package with the launchers on PATH, which `paseo daemon restart` no longer
-    does (see PASEO_WORKER_RESTART). A daemon run by a systemd service is
-    restarted through systemd instead, keeping its supervision and environment.
-    Returns whether the daemon was restarted.
+    A `--foreground` launch becomes `paseo daemon run`, the removed flags turn
+    into the environment overrides it reads, and the rest of the line (a shell
+    wrapper, other arguments) is kept as written. None when a flag has no
+    override, the launch runs in the background (which ignores overrides), or
+    the line holds more than one launch.
     """
-    pid = daemon_pid(paseo_bin, env)
-    service = systemd_service(process_cgroup(pid)) if pid else None
-    if service is not None:
-        return restart_systemd_service(service, paseo_bin, env)
+    launches = list(PASEO_LAUNCH.finditer(exec_start))
+    if len(launches) != 1:
+        return None
+    launch = launches[0]
+    tokens, kept, environment, foreground = launch["args"].split(), [], {}, False
+    while tokens:
+        token = tokens.pop(0)
+        flag, equals, value = token.partition("=")
+        if flag in REMOVED_VALUE_FLAGS:
+            value = value if equals else (tokens.pop(0) if tokens else "")
+            if REMOVED_VALUE_FLAGS[flag] is None or not LAUNCH_VALUE.fullmatch(value):
+                return None
+            environment[REMOVED_VALUE_FLAGS[flag]] = value
+        elif token in REMOVED_SWITCHES:
+            if REMOVED_SWITCHES[token] is None:
+                return None
+            environment.update(REMOVED_SWITCHES[token])
+            foreground = foreground or token == "--foreground"
+        else:
+            kept.append(token)
+    command = launch["command"]
+    if foreground:
+        command = re.sub(r"(?:daemon\s+)?(?:start|run|restart)$", "daemon run", command)
+    elif not re.search(r"daemon\s+run$", command):
+        return None
+    args = launch["args"]
+    rebuilt = exec_start[launch.start():launch.start("command")] + command + "".join(f" {token}" for token in kept)
+    return exec_start[:launch.start()] + rebuilt + args[len(args.rstrip()):] + exec_start[launch.end():], environment
+
+
+def unit_exec_start(paths):
+    """ExecStart commands left after reading unit files in order (an empty one resets), or None when unreadable."""
+    commands = []
+    for path in paths:
+        try:
+            text = Path(path).read_text()
+        except (OSError, UnicodeError):
+            return None
+        section = None
+        for line in text.replace("\\\n", " ").splitlines():
+            line = line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line
+                continue
+            key, equals, value = line.partition("=")
+            if section == "[Service]" and equals and key.strip() == "ExecStart":
+                commands = [*commands, value.strip()] if value.strip() else []
+    return commands
+
+
+def service_repair(scope, unit):
+    """(drop-in path, its text, ExecStart, environment) fixing a unit's daemon launch for Paseo 0.9, or None.
+
+    The drop-in overrides only ExecStart and adds the environment overrides,
+    leaving the unit's own files as they are.
+    """
+    fragment = unit.get("FragmentPath", "")
+    commands = unit_exec_start([fragment, *unit.get("DropInPaths", "").split()]) if fragment else None
+    rewritten = rewrite_launch(commands[0]) if commands and len(commands) == 1 else None
+    if rewritten is None:
+        return None
+    exec_start, environment = rewritten
+    text = "\n".join([
+        "# Written by the claude-codex installer: Paseo 0.9 removed launch flags this unit's",
+        "# ExecStart passed, so the service failed to start. This runs the daemon with",
+        "# `paseo daemon run`, passing those settings as the environment overrides it reads.",
+        "# Delete this file once the unit's own ExecStart is updated.",
+        "[Service]", "ExecStart=", f"ExecStart={exec_start}",
+        *(f"Environment={name}={value}" for name, value in environment.items()),
+    ]) + "\n"
+    if scope == "system":
+        base = Path("/etc/systemd/system")
+    else:
+        base = Path(xdg_home("XDG_CONFIG_HOME", ".config")) / "systemd" / "user"
+    return base / f"{unit['Id']}.d" / SERVICE_DROP_IN, text, exec_start, environment
+
+
+def systemctl_command(scope):
+    return ["systemctl", "--user"] if scope == "user" else ["systemctl"]
+
+
+def systemctl_show(scope, names):
+    """SERVICE_PROPERTIES of each named unit, in order; raises SetupError when systemctl cannot tell."""
+    result = subprocess.run([*systemctl_command(scope), "show", f"--property={','.join(SERVICE_PROPERTIES)}", "--",
+                             *names], capture_output=True, text=True)
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        raise SetupError((result.stderr or "").strip() or f"exit {result.returncode}")
+    units = []
+    for block in result.stdout.strip().split("\n\n"):
+        unit = {}
+        for line in block.splitlines():
+            key, _, value = line.partition("=")
+            # A unit with several commands lists each on its own line.
+            unit[key] = f"{unit[key]}\n{value}" if key in unit else value
+        units.append(unit)
+    return units
+
+
+def service_units(scope):
+    """Every service systemd knows in a scope, loaded or only installed; none when it cannot be reached."""
+    names = {}
+    for listing in (["list-units", "--all"], ["list-unit-files"]):
+        result = subprocess.run([*systemctl_command(scope), *listing, "--type=service", "--plain", "--no-legend",
+                                 "--no-pager"], capture_output=True, text=True)
+        for line in (result.stdout or "").splitlines() if result.returncode == 0 else ():
+            name = next(iter(line.split()), "")
+            # A template (name@.service) runs only as its instances, which list-units shows.
+            if name.endswith(".service") and not name.endswith("@.service"):
+                names[name] = None
+    return list(names)
+
+
+def service_home(scope, unit, launch):
+    """The Paseo home a service's daemon launch uses, or None when it cannot be told."""
+    try:
+        environment = dict(entry.split("=", 1) for entry in shlex.split(unit.get("Environment", "")) if "=" in entry)
+    except ValueError:
+        return None
+    user = unit.get("User") or "root"
+    if scope == "user":
+        user_home = str(Path.home())
+    else:
+        # A system service runs as its User=, root by default.
+        try:
+            user_home = (pwd.getpwuid(int(user)) if user.isdigit() else pwd.getpwnam(user)).pw_dir
+        except KeyError:
+            return None
+    home = environment.get("HOME") or user_home
+    option = re.search(r"--home(?:=|\s+)([^\s;&|\"'`]+)", launch.group(0))
+    value = (option.group(1) if option else environment.get("PASEO_HOME") or os.path.join(home, ".paseo"))
+    value = value.replace("%h", user_home)
+    value = home + value[1:] if value.startswith("~/") else value
+    return Path(value).resolve() if value.startswith("/") and not re.search(r"[$%~]", value) else None
+
+
+def paseo_services(home):
+    """(scope, properties) of the systemd services, user ones first, meant to run this Paseo home's daemon.
+
+    Found by their ExecStart, so a service that keeps failing to start counts
+    as much as one running the daemon; one that neither starts at boot (or
+    login) nor runs is left out.
+    """
+    if shutil.which("systemctl") is None:
+        return []
+    services = []
+    for scope in ("user", "system"):
+        names = service_units(scope)
+        try:
+            units = systemctl_show(scope, names) if names else []
+        except SetupError:
+            continue
+        for unit in units:
+            launch = PASEO_LAUNCH.search(unit.get("ExecStart", ""))
+            wanted = unit.get("UnitFileState") in STARTED_UNIT_STATES or unit.get("ActiveState") in RUNNING_STATES
+            if launch and wanted and service_home(scope, unit, launch) == home:
+                services.append((scope, unit))
+    return services
+
+
+def root_prefix():
+    """How to run a command as root: directly when already root, through sudo, or None when neither works."""
+    if os.geteuid() == 0:
+        return []
+    return ["sudo"] if shutil.which("sudo") else None
+
+
+def write_drop_in(path, text, root):
+    """Write a unit drop-in, through root when that is needed; False when it could not be written."""
+    if not root:
+        try:
+            atomic_write(path, text, mode=0o644)
+        except OSError as exc:
+            say(f"Could not write {path}: {exc}", "warn")
+            return False
+        return True
+    fd, temporary = tempfile.mkstemp(prefix="claude-codex-drop-in-")
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(text)
+        # Readable by all, like the unit, so systemctl cat still shows it.
+        return (subprocess.run([*root, "install", "-d", "-m", "0755", str(path.parent)]).returncode == 0
+                and subprocess.run([*root, "install", "-m", "0644", temporary, str(path)]).returncode == 0)
+    finally:
+        os.unlink(temporary)
+
+
+def relaunch_daemon(paseo_bin, env, pid):
+    """Stop and start the daemon from this environment and the installed Paseo."""
     if pid:
         say("Stopping the local Paseo daemon...")
     # A no-op when the daemon is not running; --force only applies after the graceful deadline.
@@ -710,6 +885,120 @@ def restart_paseo_daemon(paseo_bin, env):
     say(f"Starting the local Paseo daemon with {paseo_bin}...")
     subprocess.run([paseo_bin, "daemon", "start"], env=env, check=True)
     return True
+
+
+def leave_service(message, runs_daemon, paseo_bin, env, pid):
+    """Report a service left as it is; a daemon it does not run is relaunched directly meanwhile."""
+    if runs_daemon:
+        say(f"{message} The daemon was left running as it is.", "warn")
+        return False
+    say(f"{message} Meanwhile the installer runs the daemon outside the service.", "warn")
+    return relaunch_daemon(paseo_bin, env, pid)
+
+
+def restart_systemd_service(scope, name, paseo_bin, env, pid, runs_daemon, unit=None, interactive=False):
+    """Restart the daemon through the systemd service meant to run it, first repairing one Paseo 0.9 broke.
+
+    `runs_daemon` says whether the running daemon (if any) is the service's
+    own; `unit` holds the service's properties when they are already known.
+    A system service needs root, through sudo only after the user agreed.
+    Returns False when the daemon was left running as it is.
+    """
+    control = systemctl_command(scope)
+    manager = "sudo systemctl" if scope == "system" else "systemctl --user"
+    # A daemon started outside the service holds its home until it is stopped.
+    stop = "paseo-codex daemon stop && " if pid and not runs_daemon else ""
+    edit_hint = ("Edit the unit to run `paseo daemon run` (settings now live in config.json; see paseo daemon "
+                 f"config), then: {manager} daemon-reload && {stop}{manager} restart {name}")
+    version = paseo_version(paseo_bin, env)
+    repair = None
+    if version is None or version >= PASEO_WORKER_RESTART:
+        if unit is None:
+            try:
+                unit = systemctl_show(scope, [name])[0]
+            except SetupError as exc:
+                # Without the unit's launch command, a restart could stop a daemon
+                # that no longer starts; leave it to the user.
+                say(f"The Paseo daemon is run by systemd service {name}, but its unit could not be inspected "
+                    f"({exc}); the daemon was left running. Restart it yourself: {manager} restart {name}", "warn")
+                return False
+        removed = removed_launch_flags(unit.get("ExecStart", ""))
+        if removed:
+            say(f"Systemd service {name} launches the Paseo daemon with {' '.join(removed)}, which Paseo 0.9 "
+                "removed, so it fails every time it starts, at boot included.", "warn")
+            repair = service_repair(scope, unit)
+            if repair is None:
+                return leave_service(edit_hint, runs_daemon, paseo_bin, env, pid)
+    root = []
+    if scope == "system":
+        root = root_prefix()
+        if repair:
+            manual = f"{name} was left as it is. Rerun install.sh in a terminal to repair it, or: {edit_hint}"
+        elif runs_daemon:
+            manual = f"Restart it yourself to apply the configuration: {manager} restart {name}"
+        else:
+            manual = f"To run the daemon under it: {stop}{manager} restart {name}"
+        if root is None or (root and not interactive):
+            return leave_service(manual, runs_daemon, paseo_bin, env, pid)
+        if root:
+            if repair:
+                path, _, exec_start, environment = repair
+                overrides = "".join(f" {variable}={value}" for variable, value in environment.items())
+                say(f"The installer can add {path}, which runs `{exec_start}`"
+                    f"{f' with{overrides}' if overrides else ''} instead.")
+            elif runs_daemon:
+                say(f"The Paseo daemon is run by system service {name}; restarting it applies the configuration.")
+            else:
+                say(f"System service {name} runs the Paseo daemon at boot, but "
+                    f"{'the running daemon was started outside it' if pid else 'it is not running now'}.")
+            action = "Repair and restart" if repair else "Restart"
+            if ask(f"{action} {name} with sudo now? (Enter for yes; type skip to skip): ").lower() == "skip":
+                return leave_service(manual, runs_daemon, paseo_bin, env, pid)
+    if repair:
+        path, text, *_ = repair
+        say(f"Repairing {name} with {path}...")
+        if not write_drop_in(path, text, root) or subprocess.run([*root, *control, "daemon-reload"]).returncode != 0:
+            return leave_service(f"{name} could not be repaired. {edit_hint}", runs_daemon, paseo_bin, env, pid)
+        try:
+            remaining = removed_launch_flags(systemctl_show(scope, [name])[0].get("ExecStart", ""))
+        except SetupError:
+            remaining = removed
+        if remaining:
+            return leave_service(f"{name} still launches the daemon with {' '.join(remaining)} after adding {path}; "
+                                 f"another setting overrides its ExecStart (see systemctl cat {name}). {edit_hint}",
+                                 runs_daemon, paseo_bin, env, pid)
+    if pid and not runs_daemon:
+        say("Stopping the Paseo daemon started outside the service...")
+        subprocess.run([paseo_bin, "daemon", "stop", "--force"], env=env, check=True)
+    if not runs_daemon:
+        # A service that kept failing may have reached its start limit.
+        subprocess.run([*root, *control, "reset-failed", name], capture_output=True)
+    say(f"Restarting the Paseo daemon through systemd {scope} service {name}...")
+    if subprocess.run([*root, *control, "restart", name]).returncode != 0:
+        raise SetupError(f"{manager} restart {name} failed; check {manager} status {name}, then run "
+                         "paseo-codex reload once the daemon is up")
+    return True
+
+
+def restart_paseo_daemon(paseo_bin, env, interactive=False):
+    """Relaunch the local daemon so it runs the installed Paseo with this environment.
+
+    Stopping and starting relaunches supervisor and worker from the current
+    package with the launchers on PATH, which `paseo daemon restart` no longer
+    does (see PASEO_WORKER_RESTART). A daemon a systemd service runs, or is
+    meant to run (found by its ExecStart, even while it keeps failing), is
+    restarted through systemd instead, keeping its supervision and environment.
+    Returns whether the daemon was restarted.
+    """
+    pid = daemon_pid(paseo_bin, env)
+    running_in = systemd_service(process_cgroup(pid)) if pid else None
+    if running_in is not None:
+        return restart_systemd_service(*running_in, paseo_bin, env, pid, True, interactive=interactive)
+    services = paseo_services(absolute(env.get("PASEO_HOME") or Path.home() / ".paseo"))
+    if services:
+        scope, unit = services[0]
+        return restart_systemd_service(scope, unit["Id"], paseo_bin, env, pid, False, unit, interactive)
+    return relaunch_daemon(paseo_bin, env, pid)
 
 
 def daemon_path_entries(pid):
@@ -1447,7 +1736,7 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
             say("Paseo daemon not restarted (--skip-paseo-start); run paseo-codex daemon stop, then paseo-codex "
                 "daemon start, to apply the configuration.", "warn")
         else:
-            restarted = restart_paseo_daemon(paseo_bin, env)
+            restarted = restart_paseo_daemon(paseo_bin, env, interactive=not opts.skip_login and sys.stdin.isatty())
             reload_paseo(paseo_bin, env)
             if not restarted:
                 say("The configuration was reloaded into the running daemon; a changed listen address or PATH "
