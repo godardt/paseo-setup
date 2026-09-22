@@ -19,6 +19,7 @@ from test_proxy_integration import Upstream, free_port
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import claude_codex as runtime
+import install
 
 
 def copy_paseo_package(binary, destination):
@@ -162,8 +163,10 @@ class PaseoIntegrationTests(unittest.TestCase):
                if not key.startswith(("PASEO_", "CLAUDE_", "ANTHROPIC_", "OPENAI_", "CODEX_"))
                and key != "CLAUDECODE"}
         env["PASEO_HOME"] = str(paseo_home)
+        # Paseo commands select the daemon by PASEO_HOME; PASEO_HOST as well
+        # is ambiguous since 0.9. Direct client connections use the endpoint
+        # instead (client_environment).
         endpoint = f"127.0.0.1:{free_port()}"
-        env["PASEO_HOST"] = endpoint
         home = base / "home"
         home.mkdir()
         env["HOME"] = str(home)
@@ -183,6 +186,10 @@ class PaseoIntegrationTests(unittest.TestCase):
         })
         return env, paseo_home, endpoint, daemon_profile
 
+    def client_environment(self, env, endpoint):
+        """Environment for direct daemon client connections: the endpoint, not the home."""
+        return {**{name: value for name, value in env.items() if name != "PASEO_HOME"}, "PASEO_HOST": endpoint}
+
     def install_command(self, base, claude_bin, paseo_bin, *extra):
         return [
             "bash", str(ROOT / "install.sh"), "--config-dir", str(base / "config"),
@@ -200,7 +207,8 @@ class PaseoIntegrationTests(unittest.TestCase):
             private_root = base / "private-paseo-cli"
             private_paseo = copy_paseo_package(os.environ["PASEO_TEST_BINARY"], private_root)
             client_module = private_root / "dist" / "utils" / "client.js"
-            env, paseo_home, _, daemon_profile = self.isolated_daemon_environment(base)
+            env, paseo_home, endpoint, daemon_profile = self.isolated_daemon_environment(base)
+            client_env = self.client_environment(env, endpoint)
             fake_claude = base / "fake-claude"
             fake_claude.write_text(f"#!{sys.executable}\n" + FAKE_PEPPY_CLAUDE)
             fake_claude.chmod(0o755)
@@ -218,8 +226,9 @@ class PaseoIntegrationTests(unittest.TestCase):
             self.assertNotIn("sk-ant-oat01", (paseo_home / "config.json").read_text())
             paseo = str(base / "bin" / "paseo-codex")
             try:
-                self.run_paseo(paseo, env, "daemon", "restart", "--json", timeout=90)
-                self.run_paseo(paseo, env, "reload", "--json")
+                # The installer's own relaunch: stop (a no-op here), start, reload.
+                install.restart_paseo_daemon(paseo, env)
+                install.reload_paseo(paseo, env)
                 project = base / "project"
                 project.mkdir()
                 run = self.run_paseo(paseo, env, "run", "--provider", "claude-peppy",
@@ -237,7 +246,7 @@ class PaseoIntegrationTests(unittest.TestCase):
                                  "Paseo sessions must not land in the terminal profile of the second account")
                 # A fresh daemon rebuilds the conversation without any patch.
                 self.run_paseo(paseo, env, "daemon", "restart", "--json", timeout=90)
-                snapshot = self.fetch_agent(client_module, env, agent_id, with_timeline=True)
+                snapshot = self.fetch_agent(client_module, client_env, agent_id, with_timeline=True)
                 timeline_text = json.dumps(snapshot["timeline"])
                 self.assertIn("Reply with OK.", timeline_text)
                 self.assertIn("OK", timeline_text)
@@ -253,7 +262,8 @@ class PaseoIntegrationTests(unittest.TestCase):
             private_root = base / "private-paseo-cli"
             private_paseo = copy_paseo_package(os.environ["PASEO_TEST_BINARY"], private_root)
             client_module = private_root / "dist" / "utils" / "client.js"
-            env, _, _, daemon_profile = self.isolated_daemon_environment(base)
+            env, _, endpoint, daemon_profile = self.isolated_daemon_environment(base)
+            client_env = self.client_environment(env, endpoint)
             install_command = self.install_command(base, os.environ["CLAUDE_TEST_BINARY"], str(private_paseo))
             for attempt in range(2):
                 result = subprocess.run(install_command, env=env, stdin=subprocess.DEVNULL,
@@ -284,25 +294,23 @@ class PaseoIntegrationTests(unittest.TestCase):
             paseo = str(base / "bin" / "paseo-codex")
             try:
                 proxy.start()
-                restart = subprocess.run([paseo, "daemon", "restart", "--json"], env=env,
-                                         capture_output=True, text=True, timeout=90)
-                self.assertEqual(restart.returncode, 0, restart.stderr + restart.stdout)
-                reload_result = subprocess.run([paseo, "reload", "--json"], env=env,
-                                               capture_output=True, text=True, timeout=30)
-                self.assertEqual(reload_result.returncode, 0, reload_result.stderr + reload_result.stdout)
+                # The installer's own relaunch: stop (a no-op here), start, reload.
+                install.restart_paseo_daemon(paseo, env)
+                install.reload_paseo(paseo, env)
                 if effort == "ultracode":
                     catalog = subprocess.run(["node", "--input-type=module", "-e",
-                        "const {connectToDaemon}=await import(process.argv[1]); const client=await connectToDaemon(); "
+                        "const {connectToDaemon}=await import(process.argv[1]); "
+                        "const client=await connectToDaemon({target:{kind:'endpoint',host:process.env.PASEO_HOST}}); "
                         "try {console.log(JSON.stringify(await client.listProviderModels('claude-codex',{cwd:process.argv[2]})));} "
                         "finally {await client.close();}", client_module.as_uri(), str(base)],
-                        env=env, capture_output=True, text=True, timeout=30)
+                        env=client_env, capture_output=True, text=True, timeout=30)
                     self.assertEqual(catalog.returncode, 0, catalog.stderr)
                     models = json.loads(catalog.stdout)["models"]
                     selected = next(model for model in models if model["id"] == runtime.ULTRACODE_MODEL)
                     self.assertIn("Ultra Code", selected["label"])
                     self.assertEqual(selected["thinkingOptions"][0]["id"], "ultracode")
                 if check_auto_mode:
-                    self.run_auto_mode_session(paseo, client_module, env, base, upstream)
+                    self.run_auto_mode_session(paseo, client_module, env, client_env, base, upstream)
                     return
                 result = subprocess.run([
                     paseo, "run", "--provider", "claude-codex", "--model", runtime.model_id(effort),
@@ -322,10 +330,11 @@ class PaseoIntegrationTests(unittest.TestCase):
                 if check_usage:
                     agent_id = re.search(r'"agentId"\s*:\s*"([^"]+)"', result.stdout).group(1)
                     report = subprocess.run(["node", "--input-type=module", "-e",
-                        "const {connectToDaemon}=await import(process.argv[1]); const client=await connectToDaemon(); "
+                        "const {connectToDaemon}=await import(process.argv[1]); "
+                        "const client=await connectToDaemon({target:{kind:'endpoint',host:process.env.PASEO_HOST}}); "
                         "try {const result=await client.fetchAgent({agentId:process.argv[2]}); "
                         "console.log(JSON.stringify(result.agent.lastUsage));} finally {await client.close();}",
-                        client_module.as_uri(), agent_id], env=env, capture_output=True, text=True, timeout=20)
+                        client_module.as_uri(), agent_id], env=client_env, capture_output=True, text=True, timeout=20)
                     self.assertEqual(report.returncode, 0, report.stderr)
                     usage = json.loads(report.stdout)
                     self.assertEqual(usage.get("contextWindowMaxTokens"), 1050000, usage)
@@ -336,10 +345,11 @@ class PaseoIntegrationTests(unittest.TestCase):
                                           env=env, capture_output=True, text=True, timeout=90)
                     self.assertEqual(sent.returncode, 0, sent.stderr + sent.stdout)
                     report = subprocess.run(["node", "--input-type=module", "-e",
-                        "const {connectToDaemon}=await import(process.argv[1]); const client=await connectToDaemon(); "
+                        "const {connectToDaemon}=await import(process.argv[1]); "
+                        "const client=await connectToDaemon({target:{kind:'endpoint',host:process.env.PASEO_HOST}}); "
                         "try {const result=await client.fetchAgent({agentId:process.argv[2]}); "
                         "console.log(JSON.stringify(result.agent.lastUsage));} finally {await client.close();}",
-                        client_module.as_uri(), agent_id], env=env, capture_output=True, text=True, timeout=20)
+                        client_module.as_uri(), agent_id], env=client_env, capture_output=True, text=True, timeout=20)
                     self.assertEqual(report.returncode, 0, report.stderr)
                     usage = json.loads(report.stdout)
                     self.assertEqual(usage.get("contextWindowMaxTokens"), 1050000, usage)
@@ -372,7 +382,7 @@ class PaseoIntegrationTests(unittest.TestCase):
         report = subprocess.run([
             "node", "--input-type=module", "-e",
             "const {connectToDaemon}=await import(process.argv[1]); "
-            "const client=await connectToDaemon({host:process.env.PASEO_HOST}); "
+            "const client=await connectToDaemon({target:{kind:'endpoint',host:process.env.PASEO_HOST}}); "
             "try {const result=await client.fetchAgent({agentId:process.argv[2]}); "
             "if (!result) throw new Error('Temporary agent was not found'); "
             "const agent=result.agent; let timeline; "
@@ -395,7 +405,7 @@ class PaseoIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr[-3000:] + result.stdout[-3000:])
         return result
 
-    def run_auto_mode_session(self, paseo, client_module, env, base, upstream):
+    def run_auto_mode_session(self, paseo, client_module, env, client_env, base, upstream):
         project = base / "project"
         project.mkdir()
         plugins = self.run_paseo(paseo, env, "plugin", "ls", "--json")
@@ -406,7 +416,7 @@ class PaseoIntegrationTests(unittest.TestCase):
         result = self.run_paseo(paseo, env, "run", "--provider", "claude-codex", "--model", runtime.model_id("high"),
                                 "--cwd", str(project), "--wait-timeout", "60s", "--json", "Reply with OK.")
         default_agent = re.search(r'"agentId"\s*:\s*"([^"]+)"', result.stdout).group(1)
-        snapshot = self.fetch_agent(client_module, env, default_agent)
+        snapshot = self.fetch_agent(client_module, client_env, default_agent)
         self.assertEqual(snapshot["runtimeModeId"], "default", snapshot)
         self.assertIn("bypassPermissions", snapshot["availableModes"], snapshot)
         # An agent that explicitly asks for auto mode, such as one created from
@@ -415,7 +425,7 @@ class PaseoIntegrationTests(unittest.TestCase):
         result = self.run_paseo(paseo, env, "run", "--provider", "claude-codex", "--model", runtime.model_id("high"),
                                 "--mode", "auto", "--cwd", str(project), "--wait-timeout", "60s", "--json", "Reply with OK.")
         auto_agent = re.search(r'"agentId"\s*:\s*"([^"]+)"', result.stdout).group(1)
-        snapshot = self.fetch_agent(client_module, env, auto_agent)
+        snapshot = self.fetch_agent(client_module, client_env, auto_agent)
         self.assertEqual(snapshot["currentModeId"], "default", snapshot)
         self.assertEqual(snapshot["runtimeModeId"], "default", snapshot)
         requests = []

@@ -48,9 +48,9 @@ Prompts, in order (Enter to accept, `skip` to skip):
 3. ChatGPT sign-in for Claude Codex (later: `claude-codex-proxy login`).
 4. Second-account sign-in for Paseo sessions (later: rerun `install.sh`).
 
-The installer downloads CLIProxyAPI 7.2.155 (checksum verified), installs the launchers into `~/.local/bin`, adds it to your shell PATH, sends one small live request to verify Astra access, and, when Paseo is present, merges the providers, plugin, and pull request policy into `$PASEO_HOME/config.json` (backup kept), opens the daemon to the LAN, and restarts it with the launchers on its PATH. Finish active Paseo sessions first.
+The installer downloads CLIProxyAPI 7.2.155 (checksum verified), installs the launchers into `~/.local/bin`, adds it to your shell PATH, sends one small live request to verify Astra access, and, when Paseo is present, merges the providers, plugin, and pull request policy into `$PASEO_HOME/config.json` (backup kept), opens the daemon to the LAN, and relaunches it (stop, then start) so it runs the installed Paseo with the launchers on its PATH. A daemon run by a systemd user service is restarted through `systemctl --user` instead. Finish active Paseo sessions first.
 
-Rerun `install.sh` after pulling updates. Tokens, OAuth credentials, and settings are preserved. Upgrading Paseo needs no rerun.
+Rerun `install.sh` after pulling updates. Tokens, OAuth credentials, and settings are preserved. Upgrading Paseo needs no rerun, but rerunning after one relaunches the daemon on the new version: since Paseo 0.9, `paseo daemon restart` only replaces the worker and keeps the supervisor from the old launch.
 
 ### Options
 
@@ -122,7 +122,7 @@ Paseo cuts a new worktree from your **local** default branch, which is only as c
 paseo-codex-worktree-setup init /path/to/repo   # writes {"worktree": {"setup": "paseo-codex-worktree-setup"}}
 ```
 
-A checked-out existing branch is fast-forwarded to its `origin` counterpart; a branch with its own commits, a diverged branch, or a pull request checkout is left alone. A failed fetch fails the setup, so the worktree is never silently stale. The daemon must have `~/.local/bin` on its PATH; the installer restarts it that way.
+A checked-out existing branch is fast-forwarded to its `origin` counterpart; a branch with its own commits, a diverged branch, or a pull request checkout is left alone. A failed fetch fails the setup, so the worktree is never silently stale. The daemon must have `~/.local/bin` on its PATH; the installer starts it that way, and warns when a daemon it does not launch (a systemd service) lacks it.
 
 The installer also appends a **pull request policy** to `daemon.appendSystemPrompt` in Paseo's `config.json`, between `[claude-codex pull-request policy]` markers so reruns update it and your own text around it stays. Agents on a worktree or non-default branch finish a completed task by committing, pushing, and opening a pull request against the default branch with `gh pr create`, reporting its URL, unless one already exists or you asked otherwise. Requires an authenticated `gh` on the daemon host. `--skip-pull-requests` leaves the prompt alone.
 
@@ -180,6 +180,8 @@ Troubleshooting:
 - **Installer waits:** another run holds `install.lock`. Don't delete it.
 - **Executable rejected as recursive:** point `--claude-bin`/`--paseo-bin` at the original, not a wrapper.
 - **Paseo provider absent:** `paseo-codex reload`, then the diagnostic above.
+- **`paseo daemon status` shows a `startedAt` from before a Paseo upgrade:** the supervisor is still the old launch (Paseo 0.9's `paseo daemon restart` only replaces the worker). Rerun `install.sh`, or `paseo-codex daemon stop && paseo-codex daemon start`.
+- **Daemon run by a systemd service on Paseo 0.9:** `paseo daemon start --foreground`, `--listen`, `--port`, and the other launch flags were removed (settings live in `config.json`; see `paseo daemon config`). The installer reports a unit whose `ExecStart` still passes one and leaves the daemon running; change the unit to `exec paseo daemon run`, then `systemctl --user daemon-reload && systemctl --user restart paseo.service`.
 - **Plugin `failed`:** `paseo-codex plugin logs claude-codex`. Needs Paseo 0.8+.
 - **Tool "denied by the auto mode classifier":** old session or `CLAUDE_CODEX_AUTO_MODE=1`. Start a new agent or change mode.
 - **Empty conversation in Paseo:** transcript is in another profile. Send one message; the launcher moves it and history returns on the next reload.

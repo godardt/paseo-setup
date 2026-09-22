@@ -596,6 +596,146 @@ def reload_paseo(paseo_bin, env, timeout=90):
         time.sleep(1)
 
 
+# Since Paseo 0.9, `paseo daemon restart` only replaces the daemon's worker:
+# the supervisor keeps the package and environment it was launched with, and a
+# stopped daemon is not started. These launch flags were removed at the same
+# time (settings moved to config.json); a service unit still passing one to
+# `paseo daemon start` fails on its next start.
+PASEO_WORKER_RESTART = (0, 9, 0)
+REMOVED_LAUNCH_FLAGS = ("--foreground", "--listen", "--port", "--relay", "--no-relay", "--relay-use-tls",
+                        "--no-mcp", "--no-inject-mcp", "--web-ui", "--no-web-ui", "--hostnames", "--allowed-hosts")
+
+
+def paseo_version(paseo_bin, env):
+    """The Paseo CLI's version as a tuple, or None when it cannot be read."""
+    result = subprocess.run([paseo_bin, "--version"], env=env, capture_output=True, text=True)
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", result.stdout or "") if result.returncode == 0 else None
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def daemon_pid(paseo_bin, env):
+    """PID of the running local daemon's top process, or None when it is stopped or unknown."""
+    result = subprocess.run([paseo_bin, "daemon", "status", "--json"], env=env, capture_output=True, text=True)
+    try:
+        status = json.loads(result.stdout or "") if result.returncode == 0 else None
+    except ValueError:
+        status = None
+    pid = status.get("pid") if isinstance(status, dict) else None
+    return pid if isinstance(pid, int) and pid > 0 else None
+
+
+def process_cgroup(pid):
+    """The process's cgroup listing on Linux; empty elsewhere or once it has exited."""
+    try:
+        return Path(f"/proc/{pid}/cgroup").read_text()
+    except OSError:
+        return ""
+
+
+def systemd_service(cgroup):
+    """("user" or "system", unit) when a cgroup listing places the process in a systemd service."""
+    for line in cgroup.splitlines():
+        parts = line.rpartition(":")[2].strip("/").split("/")
+        unit = parts[-1]
+        if not unit.endswith(".service") or re.fullmatch(r"user@\d+\.service", unit):
+            continue
+        scope = "user" if any(re.fullmatch(r"user@\d+\.service", part) for part in parts[:-1]) else "system"
+        return scope, unit
+    return None
+
+
+def removed_launch_flags(exec_start):
+    """Removed launch flags a service's ExecStart still passes to paseo daemon."""
+    found = []
+    for launch in re.finditer(r"\bdaemon\s+(?:start|run|restart)\b([^;]*)", exec_start):
+        for flag in re.findall(r"(?<![\w-])--[\w-]+", launch.group(1)):
+            if flag in REMOVED_LAUNCH_FLAGS and flag not in found:
+                found.append(flag)
+    return found
+
+
+def restart_systemd_service(service, paseo_bin, env):
+    """Restart a daemon that a systemd service runs, through systemd; False when left running."""
+    scope, unit = service
+    control = ["systemctl", "--user"] if scope == "user" else ["systemctl"]
+    manager = " ".join(control)
+    version = paseo_version(paseo_bin, env)
+    removed = []
+    if version is None or version >= PASEO_WORKER_RESTART:
+        shown = subprocess.run([*control, "show", "--property=ExecStart", "--value", unit],
+                               capture_output=True, text=True)
+        if shown.returncode != 0 or not (shown.stdout or "").strip():
+            # Without the unit's launch command, a restart could stop a daemon
+            # that no longer starts; leave it to the user.
+            say(f"The Paseo daemon is run by systemd service {unit}, but its unit could not be inspected "
+                f"({(shown.stderr or '').strip() or f'exit {shown.returncode}'}); the daemon was left running. "
+                f"Restart it yourself: {manager} restart {unit}", "warn")
+            return False
+        removed = removed_launch_flags(shown.stdout)
+    if removed:
+        say(f"The Paseo daemon is run by systemd service {unit}, whose ExecStart still passes {' '.join(removed)} "
+            "to paseo daemon. Paseo 0.9 removed these launch flags, so the service will fail the next time it "
+            "starts; the daemon was left running as it is. Edit the unit to run `paseo daemon run` (settings now "
+            f"live in config.json; see paseo daemon config), then: {manager} daemon-reload && {manager} restart {unit}",
+            "warn")
+        return False
+    if scope == "system":
+        say(f"The Paseo daemon is run by system service {unit}; restart it to apply the configuration: "
+            f"sudo systemctl restart {unit}", "warn")
+        return False
+    say(f"Restarting the Paseo daemon through systemd user service {unit}...")
+    if subprocess.run([*control, "restart", unit]).returncode != 0:
+        raise SetupError(f"{manager} restart {unit} failed; check {manager} status {unit}, then run "
+                         "paseo-codex reload once the daemon is up")
+    return True
+
+
+def restart_paseo_daemon(paseo_bin, env):
+    """Relaunch the local daemon so it runs the installed Paseo with this environment.
+
+    Stopping and starting relaunches supervisor and worker from the current
+    package with the launchers on PATH, which `paseo daemon restart` no longer
+    does (see PASEO_WORKER_RESTART). A daemon run by a systemd service is
+    restarted through systemd instead, keeping its supervision and environment.
+    Returns whether the daemon was restarted.
+    """
+    pid = daemon_pid(paseo_bin, env)
+    service = systemd_service(process_cgroup(pid)) if pid else None
+    if service is not None:
+        return restart_systemd_service(service, paseo_bin, env)
+    if pid:
+        say("Stopping the local Paseo daemon...")
+    # A no-op when the daemon is not running; --force only applies after the graceful deadline.
+    subprocess.run([paseo_bin, "daemon", "stop", "--force"], env=env, check=True)
+    say(f"Starting the local Paseo daemon with {paseo_bin}...")
+    subprocess.run([paseo_bin, "daemon", "start"], env=env, check=True)
+    return True
+
+
+def daemon_path_entries(pid):
+    """PATH entries of a running process on Linux, or None when they cannot be read."""
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    for entry in environ.split(b"\0"):
+        if entry.startswith(b"PATH="):
+            return entry[len(b"PATH="):].decode(errors="replace").split(os.pathsep)
+    return []
+
+
+def check_daemon_path(paseo_bin, env, bin_dir):
+    """Warn when the running daemon's PATH lacks the launchers paseo.json worktree setup runs."""
+    pid = daemon_pid(paseo_bin, env)
+    entries = daemon_path_entries(pid) if pid else None
+    if entries is None or str(bin_dir) in entries:
+        return True
+    say(f"The Paseo daemon's PATH does not include {bin_dir}, so paseo.json worktree setup cannot find "
+        f"{WORKTREE_SETUP_COMMAND}. Add it to the daemon's environment (for a systemd service, an "
+        "Environment=PATH=... line in the unit), then restart the daemon.", "warn")
+    return False
+
+
 def configure_paseo_network(paseo_config, opts):
     """Make the daemon reachable from other devices on the network.
 
@@ -1304,12 +1444,15 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir, plane_enviro
         step("Paseo daemon: network access and restart")
         configure_paseo_network(paseo_config, opts)
         if opts.skip_paseo_start:
-            say("Paseo daemon not restarted (--skip-paseo-start); run paseo-codex daemon restart to apply the "
-                "configuration.", "warn")
+            say("Paseo daemon not restarted (--skip-paseo-start); run paseo-codex daemon stop, then paseo-codex "
+                "daemon start, to apply the configuration.", "warn")
         else:
-            say(f"Restarting the local Paseo daemon with {paseo_bin}...")
-            subprocess.run([paseo_bin, "daemon", "restart"], env=env, check=True)
+            restarted = restart_paseo_daemon(paseo_bin, env)
             reload_paseo(paseo_bin, env)
+            if not restarted:
+                say("The configuration was reloaded into the running daemon; a changed listen address or PATH "
+                    "applies on its next restart.", "warn")
+            check_daemon_path(paseo_bin, env, bin_dir)
     step("Done")
     say(f"Installed: {bin_dir / 'claude-codex'}", "ok")
     if paseo_bin:
