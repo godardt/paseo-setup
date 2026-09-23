@@ -516,9 +516,21 @@ def merge_paseo(path, settings, previous, include_peppy, pull_requests=True):
     prompt = daemon.get("appendSystemPrompt")
     if pull_requests:
         prompt = pull_request_policy(prompt)
+    # Since Paseo 0.9 the daemon gives agents its own `paseo` MCP server only
+    # when daemon.mcp.injectIntoAgents is true; unset now means off. An explicit
+    # value, false included, is the user's and kept.
+    mcp = daemon.get("mcp")
+    if mcp is None:
+        mcp = {}
+    if not isinstance(mcp, dict):
+        raise SetupError(f"daemon.mcp must be an object in {path}")
+    inject_mcp = mcp.get("injectIntoAgents")
+    if inject_mcp is False:
+        say("Paseo agents get no paseo MCP server (daemon.mcp.injectIntoAgents is false); turn it on with: "
+            "paseo-codex daemon config set daemon.mcp.injectIntoAgents true")
     if all(providers.get(name) == updated for name, updated in updates.items()) \
             and config.get("pluginsEnabled") is True and plugins.get(PLUGIN_ID) == entry \
-            and daemon.get("appendSystemPrompt") == prompt:
+            and daemon.get("appendSystemPrompt") == prompt and inject_mcp is not None:
         return
     providers.update(updates)
     if config.get("pluginsEnabled") is not True:
@@ -528,7 +540,11 @@ def merge_paseo(path, settings, previous, include_peppy, pull_requests=True):
     config["plugins"] = plugins
     if pull_requests:
         daemon["appendSystemPrompt"] = prompt
-        config["daemon"] = daemon
+    if inject_mcp is None:
+        say("Giving Paseo agents the daemon's paseo MCP server (daemon.mcp.injectIntoAgents), "
+            "off by default since Paseo 0.9.")
+        daemon["mcp"] = {**mcp, "injectIntoAgents": True}
+    config["daemon"] = daemon
     backup(path)
     write_json(path, config)
 
