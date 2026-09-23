@@ -22,6 +22,7 @@ import plane_mcp as plane
 SECRET = "plane-test-secret-never-print-123"
 PROJECT = "12345678-1234-1234-1234-123456789abc"
 WORK_ITEM = "abcdefab-abcd-abcd-abcd-abcdefabcdef"
+PAGE = "fedcba98-7654-4321-8765-0123456789ab"
 
 
 def request(method, params=None, request_id=1):
@@ -136,15 +137,16 @@ class CredentialTests(OfflineTests):
 
 
 class ToolTests(OfflineTests):
-    def test_only_three_read_only_tools_with_closed_schemas(self):
+    def test_only_read_only_tools_with_closed_schemas(self):
         ready(self.server)
         tools = self.server.handle(request("tools/list"))["result"]["tools"]
-        self.assertEqual([tool["name"] for tool in tools], ["list_projects", "list_work_items", "get_work_item"])
+        self.assertEqual([tool["name"] for tool in tools],
+                         ["list_projects", "list_work_items", "get_work_item", "list_pages", "get_page"])
         for tool in tools:
             self.assertEqual(tool["annotations"], {"readOnlyHint": True})
             self.assertEqual(tool["inputSchema"]["type"], "object")
             self.assertIs(tool["inputSchema"]["additionalProperties"], False)
-        for tool in tools[:2]:
+        for tool in (tool for tool in tools if tool["name"].startswith("list_")):
             schema = tool["inputSchema"]["properties"]["per_page"]
             self.assertEqual(schema["default"], plane.DEFAULT_PER_PAGE)
             self.assertEqual(schema["maximum"], 100)
@@ -154,9 +156,13 @@ class ToolTests(OfflineTests):
         cases = [("list_projects", {}, "projects/?per_page=100"),
                  ("list_work_items", {"project_id": PROJECT.upper()}, f"projects/{PROJECT}/work-items/?per_page=100"),
                  ("get_work_item", {"project_id": PROJECT, "work_item_id": WORK_ITEM.upper()},
-                  f"projects/{PROJECT}/work-items/{WORK_ITEM}/")]
+                  f"projects/{PROJECT}/work-items/{WORK_ITEM}/"),
+                 ("list_pages", {}, "pages/?per_page=100"),
+                 ("list_pages", {"project_id": PROJECT.upper()}, f"projects/{PROJECT}/pages/?per_page=100"),
+                 ("get_page", {"page_id": PAGE.upper()}, f"pages/{PAGE}/"),
+                 ("get_page", {"project_id": PROJECT, "page_id": PAGE}, f"projects/{PROJECT}/pages/{PAGE}/")]
         for name, arguments, suffix in cases:
-            with self.subTest(tool=name):
+            with self.subTest(tool=name, suffix=suffix):
                 self.transport.reset_mock()
                 body = {"results": [{"id": PROJECT}], "next_cursor": "100:1:0", "prev_cursor": "100:-1:0",
                         "next_page_results": True, "total_results": 321,
@@ -171,11 +177,13 @@ class ToolTests(OfflineTests):
                 self.assertEqual(req.timeout, plane.HTTP_TIMEOUT)
                 self.assertEqual(dict(req.header_items()), {"Host": "api.plane.so", "X-api-key": SECRET,
                                                           "Accept": "application/json", "User-agent": plane.SERVER_NAME + "/1.0"})
-                self.assertEqual(stream.read_sizes, [plane.MAX_RESPONSE_BYTES + 1])
+                limit = plane.MAX_PAGE_RESPONSE_BYTES if name == "get_page" else plane.MAX_RESPONSE_BYTES
+                self.assertEqual(stream.read_sizes, [limit + 1])
                 self.assertTrue(stream.closed)
 
     def test_pagination_is_explicit_bounded_and_query_encoded(self):
-        for name, base_args in (("list_projects", {}), ("list_work_items", {"project_id": PROJECT})):
+        for name, base_args in (("list_projects", {}), ("list_work_items", {"project_id": PROJECT}),
+                                ("list_pages", {}), ("list_pages", {"project_id": PROJECT})):
             for per_page in (1, 40, 100):
                 for cursor in ("100:1:0", "YWJjZA==", "a/b+c", "https://evil.invalid/?method=DELETE&workspace=other#x",
                                "../%2f?url=https://evil.invalid"):
@@ -186,9 +194,60 @@ class ToolTests(OfflineTests):
                         parsed = urllib.parse.urlsplit(req.full_url)
                         self.assertEqual(parsed.scheme, "https")
                         self.assertEqual(parsed.netloc, "api.plane.so")
-                        self.assertTrue(parsed.path.startswith("/api/v1/workspaces/peppy/projects/"))
+                        self.assertTrue(parsed.path.startswith("/api/v1/workspaces/peppy/"))
                         self.assertEqual(parsed.fragment, "")
                         self.assertEqual(urllib.parse.parse_qs(parsed.query), {"per_page": [str(per_page)], "cursor": [cursor]})
+
+    def test_page_filters_are_enumerated_bounded_and_query_encoded(self):
+        for page_type in plane.PAGE_TYPES:
+            for search in ("a", "Robotics workflow", "é & ü", "../pages/?type=all#x", "x" * plane.MAX_SEARCH_LENGTH):
+                with self.subTest(page_type=page_type, search=search[:20]):
+                    self.reply()
+                    self.server.call_tool("list_pages", {"type": page_type, "search": search})
+                    query = urllib.parse.urlsplit(self.transport.call_args.args[1].full_url).query
+                    self.assertEqual(urllib.parse.parse_qs(query),
+                                     {"per_page": ["100"], "type": [page_type], "search": [search]})
+        self.transport.reset_mock()
+        for value in (None, True, 1, [], {}, ["all"], "", "All", "all ", "deleted", "all&type=archived", SECRET):
+            with self.subTest(value_type=type(value).__name__), self.assertRaises(plane.RpcError) as error:
+                self.server.call_tool("list_pages", {"type": value})
+            self.assertNotIn(SECRET, str(error.exception))
+        for value in (None, True, 1, [], {}, "", "x" * (plane.MAX_SEARCH_LENGTH + 1), "a\tb", "a\r\nb",
+                      "a\x00b", "\x7f", "\ud800"):
+            with self.subTest(value_type=type(value).__name__), self.assertRaises(plane.RpcError):
+                self.server.call_tool("list_pages", {"search": value})
+        self.transport.assert_not_called()
+
+    def test_page_reads_return_one_compact_html_body(self):
+        html = ('<h2 class="editor-heading-block" data-spacing-group="heading" data-id="1">Goal &amp; plan</h2>'
+                '<p class="editor-paragraph-block" data-id="2">a &lt;b&gt; "c" &#39;d&#39;<br>'
+                ' class="kept" text</p><pre class="" data-id="3"><code class="rounded-sm language-mermaid" spellcheck="false">'
+                'A --&gt; B</code></pre><table data-id="4"><tbody><tr style=""><td colspan="1" rowspan="2" colwidth="150" '
+                'style="">cell</td></tr></tbody></table><ul data-type="taskList" data-tight="true"><li data-type="taskItem">'
+                '<input type="checkbox" checked><a href="https://example.invalid/?a=1&amp;b=&quot;2&quot;" target="_blank" '
+                'rel="noopener noreferrer" class="underline">link</a></li></ul><image-component src="asset" width="775px" '
+                'height="224px" aspectratio="3.4" alignment="left" status="uploaded"></image-component><hr/>')
+        body = {"id": PAGE, "name": "Wiki", "parent_id": None, "projects": [], "description_html": html,
+                "description_stripped": "Goal & plan", "description": {"type": "doc"},
+                "description_json": {"type": "doc"}, "description_binary": "AAEC"}
+        self.reply(body)
+        page = self.server.call_tool("get_page", {"page_id": PAGE})
+        self.assertEqual(page, {"id": PAGE, "name": "Wiki", "parent_id": None, "projects": [], "description_html": (
+            '<h2>Goal &amp; plan</h2><p>a &lt;b&gt; "c" \'d\'<br> class="kept" text</p>'
+            '<pre><code class="language-mermaid">A --&gt; B</code></pre>'
+            '<table><tbody><tr><td rowspan="2">cell</td></tr></tbody></table>'
+            '<ul data-type="taskList"><li data-type="taskItem"><input type="checkbox" checked>'
+            '<a href="https://example.invalid/?a=1&amp;b=&quot;2&quot;">link</a></li></ul>'
+            '<image-component src="asset"></image-component><hr/>')})
+        for description in (None, "", "plain text only"):
+            with self.subTest(description=description):
+                self.reply({"id": PAGE, "description_html": description, "description_binary": "AAEC"})
+                self.assertEqual(self.server.call_tool("get_page", {"page_id": PAGE}),
+                                 {"id": PAGE, "description_html": description})
+        # Only page reads are reshaped; listings keep every field Plane returns.
+        listing = {"results": [{"id": PAGE, "description_html": '<p data-id="1">x</p>', "description_binary": "AAEC"}]}
+        self.reply(listing)
+        self.assertEqual(self.server.call_tool("list_pages", {}), listing)
 
     def test_unknown_mutation_and_arbitrary_parameters_never_reach_transport(self):
         for name in ("create_project", "create_work_item", "update_work_item", "delete_work_item", "request", "GET",
@@ -199,7 +258,9 @@ class ToolTests(OfflineTests):
             self.assertNotIn(SECRET, str(error.exception))
         cases = [("list_projects", {}, {"project_id", "work_item_id"}),
                  ("list_work_items", {"project_id": PROJECT}, {"work_item_id"}),
-                 ("get_work_item", {"project_id": PROJECT, "work_item_id": WORK_ITEM}, {"cursor", "per_page"})]
+                 ("get_work_item", {"project_id": PROJECT, "work_item_id": WORK_ITEM}, {"cursor", "per_page"}),
+                 ("list_pages", {"project_id": PROJECT}, {"page_id", "work_item_id"}),
+                 ("get_page", {"page_id": PAGE}, {"cursor", "per_page", "type", "search", "work_item_id"})]
         common = {"method", "path", "url", "base_url", "endpoint", "workspace", "workspace_slug", "headers", "body",
                   "data", "api_key", "authorization", "query", "limit", "_meta", "additionalProperties", SECRET}
         for name, args, extra in cases:
@@ -210,13 +271,14 @@ class ToolTests(OfflineTests):
         self.transport.assert_not_called()
 
     def test_arguments_are_objects_and_required_ids_are_present(self):
-        for name in ("list_projects", "list_work_items", "get_work_item"):
+        for name in ("list_projects", "list_work_items", "get_work_item", "list_pages", "get_page"):
             for value in (None, False, [], ["cursor"], 0, "{}"):
                 with self.subTest(tool=name, value_type=type(value).__name__), self.assertRaises(plane.RpcError):
                     self.server.call_tool(name, value)
         for name, arguments in (("list_work_items", {}), ("get_work_item", {}),
                                 ("get_work_item", {"project_id": PROJECT}),
-                                ("get_work_item", {"work_item_id": WORK_ITEM})):
+                                ("get_work_item", {"work_item_id": WORK_ITEM}),
+                                ("get_page", {}), ("get_page", {"project_id": PROJECT})):
             with self.subTest(tool=name), self.assertRaises(plane.RpcError):
                 self.server.call_tool(name, arguments)
         self.transport.assert_not_called()
@@ -229,14 +291,17 @@ class ToolTests(OfflineTests):
         for value in bad_ids:
             for name, arguments in (("list_work_items", {"project_id": value}),
                                     ("get_work_item", {"project_id": value, "work_item_id": WORK_ITEM}),
-                                    ("get_work_item", {"project_id": PROJECT, "work_item_id": value})):
+                                    ("get_work_item", {"project_id": PROJECT, "work_item_id": value}),
+                                    ("list_pages", {"project_id": value}),
+                                    ("get_page", {"page_id": value}),
+                                    ("get_page", {"project_id": value, "page_id": PAGE})):
                 with self.subTest(tool=name, value_type=type(value).__name__), self.assertRaises(plane.RpcError) as error:
                     self.server.call_tool(name, arguments)
                 self.assertNotIn(SECRET, str(error.exception))
         self.transport.assert_not_called()
 
     def test_pagination_types_and_bounds_are_enforced_in_direct_calls(self):
-        for name, base in (("list_projects", {}), ("list_work_items", {"project_id": PROJECT})):
+        for name, base in (("list_projects", {}), ("list_work_items", {"project_id": PROJECT}), ("list_pages", {})):
             for value in (None, True, False, 0, -1, 101, 1.0, 1.5, "10", [], {}, float("inf")):
                 with self.subTest(tool=name, value_type=type(value).__name__), self.assertRaises(plane.RpcError):
                     self.server.call_tool(name, {**base, "per_page": value})
@@ -338,6 +403,14 @@ class ToolTests(OfflineTests):
                 self.server.call_tool("list_projects", {})
             self.assertIn("size limit", str(error.exception))
             self.assertEqual(stream.read_sizes, [plane.MAX_RESPONSE_BYTES + 1])
+        # Page reads carry every copy of the body, so only they get the larger limit.
+        self.reply(b'{"description_binary":"' + b"x" * plane.MAX_RESPONSE_BYTES + b'"}')
+        self.assertEqual(self.server.call_tool("get_page", {"page_id": PAGE}), {})
+        stream = self.reply(b" " * (plane.MAX_PAGE_RESPONSE_BYTES + 1))
+        with self.assertRaises(plane.ToolError) as error:
+            self.server.call_tool("get_page", {"page_id": PAGE})
+        self.assertIn("size limit", str(error.exception))
+        self.assertEqual(stream.read_sizes, [plane.MAX_PAGE_RESPONSE_BYTES + 1])
 
     def test_credentials_echoed_in_successful_json_are_redacted(self):
         for api_key in (SECRET, 'test-"quoted\\key', "x"):
@@ -545,7 +618,7 @@ class CommandTests(unittest.TestCase):
         responses = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual(len(responses), 4)
         self.assertEqual(responses[0]["result"]["protocolVersion"], "2024-11-05")
-        self.assertEqual(len(responses[1]["result"]["tools"]), 3)
+        self.assertEqual(len(responses[1]["result"]["tools"]), len(plane.TOOLS))
         self.assertEqual(responses[2]["result"], {})
         self.assertEqual(responses[3]["error"]["code"], -32602)
 

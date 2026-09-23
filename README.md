@@ -145,7 +145,9 @@ Install on each daemon host. If an earlier version of this installer patched Pas
 
 ## Plane (read-only)
 
-Create a token at [Plane's API tokens page](https://app.plane.so/settings/profile/api-tokens). The installer stores it in a `0600` file and registers a GET-only MCP server, `plane-peppy-readonly`, exposing `list_projects`, `list_work_items`, and `get_work_item` for the `peppy` workspace. Mutations, redirects, and arbitrary paths are rejected in code. The token itself is not read-only; use a least-privilege account.
+Create a token at [Plane's API tokens page](https://app.plane.so/settings/profile/api-tokens). The installer stores it in a `0600` file and registers a GET-only MCP server, `plane-peppy-readonly`, exposing `list_projects`, `list_work_items`, `get_work_item`, `list_pages`, and `get_page` for the `peppy` workspace. Mutations, redirects, and arbitrary paths are rejected in code. The token itself is not read-only; use a least-privilege account.
+
+The page tools read the wiki, or a project's pages when given its `project_id`. `list_pages` searches titles; `get_page` takes the page ID from a Plane page URL. `get_page` returns the body only as `description_html`, with editor layout attributes removed, because Plane sends each body five ways and a page would otherwise fill an agent's context.
 
 Its name is the key the launchers and the plugin merge into a session's MCP servers, so a server you configure yourself under that name takes precedence and the connector is left out.
 
@@ -153,7 +155,7 @@ Terminal `claude-codex` and `claude-peppy` sessions receive it through `--mcp-co
 
 The installer checks the token with one read-only call before writing anything. A token it supplies (`--plane-api-key-file`, `PLANE_API_KEY`) that Plane rejects fails the install; a saved token that Plane rejects is reported and replaced by prompt, so rerunning `install.sh` is how you rotate a revoked or expired one. When Plane is unreachable the token is kept as provided, and `--skip-login` stages the install without contacting Plane at all.
 
-Test it: ask an agent to "list the projects in peppy". Pass `--strict-mcp-config` to suppress injection in the terminal.
+Test it: ask an agent to "list the projects in peppy" or "list the peppy wiki pages". Pass `--strict-mcp-config` to suppress injection in the terminal.
 
 ## Diagnostics
 

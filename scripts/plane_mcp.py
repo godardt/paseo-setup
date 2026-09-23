@@ -2,6 +2,8 @@
 """Fixed-workspace, GET-only Plane MCP server, using only the Python stdlib."""
 
 import argparse
+import html
+from html.parser import HTMLParser
 import http.client
 import json
 import math
@@ -19,6 +21,8 @@ BASE_URL = "https://api.plane.so/api/v1/workspaces/peppy/"
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 HTTP_TIMEOUT = 15
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+# Plane returns a page body five times over (Yjs binary, two JSON trees, HTML, text), ~15x the text.
+MAX_PAGE_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_FRAME_BYTES = 64 * 1024
 MAX_CREDENTIAL_BYTES = 64 * 1024
 MAX_API_KEY_LENGTH = 4096
@@ -30,6 +34,15 @@ PAGINATION_PROPERTIES = {
                "description": "Opaque cursor from the previous response; never a URL to follow."},
     "per_page": {"type": "integer", "minimum": 1, "maximum": 100, "default": DEFAULT_PER_PAGE},
 }
+PAGE_TYPES = ("all", "public", "private", "shared", "archived")
+MAX_SEARCH_LENGTH = 256
+PAGE_PROJECT_SCHEMA = {**UUID_SCHEMA, "description": "Only for a project page; omit for a wiki (workspace) page."}
+# Only description_html is returned; the other copies of the body would multiply the output.
+PAGE_BODY_DUPLICATES = ("description", "description_binary", "description_json", "description_stripped")
+# Editor attributes that carry layout, not content. Unknown attributes (links, embeds, task state) are kept.
+PAGE_LAYOUT_ATTRIBUTES = frozenset({
+    "alignment", "aspectratio", "background", "colwidth", "data-has-tried-embedding", "data-id",
+    "data-spacing-group", "data-tight", "height", "rel", "spellcheck", "status", "style", "target", "width"})
 TOOLS = [
     {"name": "list_projects", "description": "List projects in the peppy Plane workspace, one page at a time.",
      "inputSchema": {"type": "object", "properties": PAGINATION_PROPERTIES, "additionalProperties": False},
@@ -41,6 +54,20 @@ TOOLS = [
     {"name": "get_work_item", "description": "Read one work item in a peppy project.",
      "inputSchema": {"type": "object", "properties": {"project_id": UUID_SCHEMA, "work_item_id": UUID_SCHEMA},
                      "required": ["project_id", "work_item_id"], "additionalProperties": False},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "list_pages", "description": "List peppy wiki pages, or one project's pages when project_id is given, "
+                                          "with titles and IDs but no content, including pagination metadata.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": PAGE_PROJECT_SCHEMA,
+         "type": {"type": "string", "enum": list(PAGE_TYPES), "default": "all"},
+         "search": {"type": "string", "minLength": 1, "maxLength": MAX_SEARCH_LENGTH,
+                    "description": "Case-insensitive page title search."},
+         **PAGINATION_PROPERTIES}, "additionalProperties": False},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "get_page", "description": "Read one peppy wiki or project page, such as the page ID in a Plane page URL. "
+                                        "description_html is the page body, without the editor's layout attributes.",
+     "inputSchema": {"type": "object", "properties": {"project_id": PAGE_PROJECT_SCHEMA, "page_id": UUID_SCHEMA},
+                     "required": ["page_id"], "additionalProperties": False},
      "annotations": {"readOnlyHint": True}},
 ]
 
@@ -135,8 +162,55 @@ def _params(value, allowed, required=()):
 
 def _uuid(value):
     if not isinstance(value, str) or re.fullmatch(UUID_PATTERN, value) is None:
-        raise RpcError(-32602, "Project and work item IDs must be canonical UUID strings.")
+        raise RpcError(-32602, "Project, work item, and page IDs must be canonical UUID strings.")
     return value.lower()
+
+
+class _CompactHtml(HTMLParser):
+    """Re-serialize editor HTML without layout attributes, which otherwise double a page's size."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+
+    def _tag(self, tag, attrs, end):
+        kept = [tag]
+        for name, value in attrs:
+            if name == "class":
+                # Only a code block's language class says anything about the content.
+                value = " ".join(item for item in (value or "").split() if item.startswith("language-"))
+                if not value:
+                    continue
+            elif name in PAGE_LAYOUT_ATTRIBUTES or (name in ("colspan", "rowspan") and value == "1"):
+                continue
+            kept.append(name if value is None else f'{name}="{html.escape(value)}"')
+        self.parts.append("<" + " ".join(kept) + end + ">")
+
+    def handle_starttag(self, tag, attrs):
+        self._tag(tag, attrs, "")
+
+    def handle_startendtag(self, tag, attrs):
+        self._tag(tag, attrs, "/")
+
+    def handle_endtag(self, tag):
+        self.parts.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        self.parts.append(html.escape(data, quote=False))
+
+
+def _page(page):
+    page = {key: value for key, value in page.items() if key not in PAGE_BODY_DUPLICATES}
+    if isinstance(page.get("description_html"), str):
+        parser = _CompactHtml()
+        parser.feed(page["description_html"])
+        parser.close()
+        page["description_html"] = "".join(parser.parts)
+    return page
+
+
+def _page_scope(arguments):
+    return f"projects/{_uuid(arguments['project_id'])}/" if "project_id" in arguments else ""
 
 
 def _http_error(status):
@@ -168,9 +242,15 @@ class PlaneServer:
         elif name == "get_work_item":
             _params(arguments, {"project_id", "work_item_id"}, {"project_id", "work_item_id"})
             route = f"projects/{_uuid(arguments['project_id'])}/work-items/{_uuid(arguments['work_item_id'])}/"
+        elif name == "list_pages":
+            _params(arguments, {"project_id", "type", "search", "cursor", "per_page"})
+            route = _page_scope(arguments) + "pages/"
+        elif name == "get_page":
+            _params(arguments, {"project_id", "page_id"}, {"page_id"})
+            route = _page_scope(arguments) + f"pages/{_uuid(arguments['page_id'])}/"
         else:
             raise RpcError(-32602, "Unknown tool.")
-        if name != "get_work_item":
+        if name.startswith("list_"):
             per_page = arguments.get("per_page", DEFAULT_PER_PAGE)
             if type(per_page) is not int or not 1 <= per_page <= 100:
                 raise RpcError(-32602, "per_page must be an integer between 1 and 100.")
@@ -181,7 +261,18 @@ class PlaneServer:
                         or any(not 33 <= ord(c) <= 126 for c in cursor)):
                     raise RpcError(-32602, "cursor must be a nonempty visible ASCII string of at most 1024 characters.")
                 query["cursor"] = cursor
+            if "type" in arguments:
+                if not isinstance(arguments["type"], str) or arguments["type"] not in PAGE_TYPES:
+                    raise RpcError(-32602, "type must be one of: " + ", ".join(PAGE_TYPES) + ".")
+                query["type"] = arguments["type"]
+            if "search" in arguments:
+                search = arguments["search"]
+                if (not isinstance(search, str) or not 1 <= len(search) <= MAX_SEARCH_LENGTH
+                        or not search.isprintable()):
+                    raise RpcError(-32602, "search must be a nonempty printable string of at most 256 characters.")
+                query["search"] = search
             route += "?" + urllib.parse.urlencode(query)
+        limit = MAX_PAGE_RESPONSE_BYTES if name == "get_page" else MAX_RESPONSE_BYTES
         request = urllib.request.Request(BASE_URL + route, method="GET", headers={
             "X-API-Key": self.api_key, "Accept": "application/json", "User-Agent": SERVER_NAME + "/1.0",
         })
@@ -191,7 +282,7 @@ class PlaneServer:
                     raise ToolError("Plane redirects are not allowed.")
                 if not 200 <= response.status < 300:
                     raise _http_error(response.status)
-                data = response.read(MAX_RESPONSE_BYTES + 1)
+                data = response.read(limit + 1)
         except urllib.error.HTTPError as exc:
             status = exc.code
             exc.close()
@@ -202,7 +293,7 @@ class PlaneServer:
             raise ToolError("Cannot connect to Plane.") from None
         except (OSError, http.client.HTTPException):
             raise ToolError("Plane request failed while receiving the response.") from None
-        if len(data) > MAX_RESPONSE_BYTES:
+        if len(data) > limit:
             raise ToolError("Plane response exceeds the size limit.")
         try:
             # Redact even JSON-escaped credentials echoed in a successful response.
@@ -211,8 +302,8 @@ class PlaneServer:
                 raise ValueError("Expected an object")
         except (ValueError, RecursionError):
             raise ToolError("Plane returned an invalid JSON object.") from None
-        # Keep the complete page and metadata. Never fetch next/previous URLs.
-        return result
+        # Keep the complete result page and metadata, less a wiki page's duplicate bodies. Never fetch next/previous URLs.
+        return _page(result) if name == "get_page" else result
 
     def dispatch(self, method, params):
         if method == "ping":
