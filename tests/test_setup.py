@@ -463,18 +463,53 @@ class InstallTests(unittest.TestCase):
             install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
         self.assertEqual(runtime.read_json(config_file)["daemon"]["appendSystemPrompt"],
                          f"Only mine.\n\n{install.PR_POLICY}")
-        # Opting out leaves the prompt exactly as found, and never creates a daemon section.
+        # Opting out leaves the prompt exactly as found, and never adds one.
         runtime.write_json(config_file, {"version": 1, "daemon": {"appendSystemPrompt": "Only mine."}})
         with patch.object(install, "say"):
             install.merge_paseo(config_file, self.settings, {}, include_peppy=True, pull_requests=False)
-        self.assertEqual(runtime.read_json(config_file)["daemon"], {"appendSystemPrompt": "Only mine."})
+        self.assertEqual(runtime.read_json(config_file)["daemon"]["appendSystemPrompt"], "Only mine.")
         runtime.write_json(config_file, {"version": 1})
         with patch.object(install, "say"):
             install.merge_paseo(config_file, self.settings, {}, include_peppy=True, pull_requests=False)
-        self.assertNotIn("daemon", runtime.read_json(config_file))
+        self.assertNotIn("appendSystemPrompt", runtime.read_json(config_file)["daemon"])
         runtime.write_json(config_file, {"version": 1, "daemon": "bad"})
         with self.assertRaises(runtime.SetupError):
             install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
+
+    def test_paseo_agents_get_the_paseo_mcp_server_unless_turned_off(self):
+        config_file = self.base / "paseo-mcp.json"
+        self.settings["peppy_config_dir"] = str(self.base / "claude-peppy")
+        previous = {"paseo_config": str(config_file)}
+        runtime.write_json(config_file, {"version": 1, "daemon": {"mcp": {"enabled": True}}})
+        with patch.object(install, "say"):
+            install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
+        current = runtime.read_json(config_file)
+        # Paseo 0.9 leaves injection off while the key is unset; other MCP settings are kept.
+        self.assertEqual(current["daemon"]["mcp"], {"enabled": True, "injectIntoAgents": True})
+        # A configuration an earlier installer run left otherwise current still gets it.
+        del current["daemon"]["mcp"]
+        runtime.write_json(config_file, current)
+        with patch.object(install, "say"):
+            install.merge_paseo(config_file, self.settings, previous, include_peppy=True)
+        self.assertEqual(runtime.read_json(config_file)["daemon"]["mcp"], {"injectIntoAgents": True})
+        # An explicit value is the user's: kept without rewriting the file, with a hint when off.
+        for value in (True, False):
+            with self.subTest(injectIntoAgents=value):
+                current["daemon"]["mcp"] = {"injectIntoAgents": value}
+                runtime.write_json(config_file, current)
+                with patch.object(install, "backup") as backup, patch.object(install, "say") as say:
+                    install.merge_paseo(config_file, self.settings, previous, include_peppy=True)
+                backup.assert_not_called()
+                self.assertIs(runtime.read_json(config_file)["daemon"]["mcp"]["injectIntoAgents"], value)
+                said = " ".join(call.args[0] for call in say.call_args_list)
+                if value:
+                    self.assertEqual(said, "")
+                else:
+                    self.assertIn("daemon config set daemon.mcp.injectIntoAgents true", said)
+        runtime.write_json(config_file, {"version": 1, "daemon": {"mcp": "bad"}})
+        with self.assertRaisesRegex(runtime.SetupError, "daemon.mcp must be an object"):
+            install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
+        self.assertEqual(runtime.read_json(config_file), {"version": 1, "daemon": {"mcp": "bad"}})
 
     def test_paseo_merge_preserves_config_and_is_idempotent(self):
         config_file = self.base / "paseo.json"
@@ -487,8 +522,10 @@ class InstallTests(unittest.TestCase):
         self.settings["peppy_config_dir"] = str(self.base / "claude-peppy")
         install.merge_paseo(config_file, self.settings, {}, include_peppy=True)
         actual = runtime.read_json(config_file)
-        # Daemon settings are kept; only the pull request policy is appended.
-        self.assertEqual(actual["daemon"], {**original["daemon"], "appendSystemPrompt": install.PR_POLICY})
+        # Daemon settings are kept; the pull request policy is appended and
+        # agents get the daemon's paseo MCP server.
+        self.assertEqual(actual["daemon"], {**original["daemon"], "appendSystemPrompt": install.PR_POLICY,
+                                            "mcp": {"injectIntoAgents": True}})
         # The plugin is registered from the data directory; other plugins and
         # settings are preserved, and the global switch is turned on.
         self.assertIs(actual["pluginsEnabled"], True)

@@ -48,7 +48,7 @@ Prompts, in order (Enter to accept, `skip` to skip):
 3. ChatGPT sign-in for Claude Codex (later: `claude-codex-proxy login`).
 4. Second-account sign-in for Paseo sessions (later: rerun `install.sh`).
 
-The installer downloads CLIProxyAPI 7.2.155 (checksum verified), installs the launchers into `~/.local/bin`, adds it to your shell PATH, sends one small live request to verify Astra access, and, when Paseo is present, merges the providers, plugin, and pull request policy into `$PASEO_HOME/config.json` (backup kept), opens the daemon to the LAN, and relaunches it (stop, then start) so it runs the installed Paseo with the launchers on its PATH. A daemon that a systemd service runs, or should run (found by its `ExecStart`, even while the service keeps failing), is restarted through that service instead; a system service asks before using `sudo`, the installer's only use of it. Finish active Paseo sessions first.
+The installer downloads CLIProxyAPI 7.2.155 (checksum verified), installs the launchers into `~/.local/bin`, adds it to your shell PATH, sends one small live request to verify Astra access, and, when Paseo is present, merges the providers, plugin, pull request policy, and Paseo MCP setting into `$PASEO_HOME/config.json` (backup kept), opens the daemon to the LAN, and relaunches it (stop, then start) so it runs the installed Paseo with the launchers on its PATH. A daemon that a systemd service runs, or should run (found by its `ExecStart`, even while the service keeps failing), is restarted through that service instead; a system service asks before using `sudo`, the installer's only use of it. Finish active Paseo sessions first.
 
 Rerun `install.sh` after pulling updates. Tokens, OAuth credentials, and settings are preserved. Upgrading Paseo needs no rerun, but rerunning after one relaunches the daemon on the new version: since Paseo 0.9, `paseo daemon restart` only replaces the worker and keeps the supervisor from the old launch.
 
@@ -113,6 +113,10 @@ Providers added to `config.json`:
 Both run in the **daemon's Claude profile** (its `CLAUDE_CONFIG_DIR` or `~/.claude`), because Paseo reloads transcripts from there. Conversations survive restarts; the daemon profile's settings, hooks, and plugins apply.
 
 The plugin adds the Plane connector (below) to every agent of the `claude`, `claude-codex`, `claude-peppy`, and `codex` providers, and rewrites an explicit Auto-mode request for the Claude Codex provider to Always Ask. To keep auto mode, add `"CLAUDE_CODEX_AUTO_MODE": "1"` to the provider's `env` and run `paseo-codex plugin disable claude-codex`.
+
+### Paseo MCP server
+
+Since Paseo 0.9, the daemon adds its own `paseo` MCP server (the tools agents use to drive Paseo) to its agents only when `daemon.mcp.injectIntoAgents` is `true`; unset now means off. The installer sets it when unset and keeps an explicit value, so `paseo-codex daemon config set daemon.mcp.injectIntoAgents false` opts out for good.
 
 ### Worktrees and pull requests
 
@@ -182,6 +186,7 @@ Troubleshooting:
 - **Paseo provider absent:** `paseo-codex reload`, then the diagnostic above.
 - **`paseo daemon status` shows a `startedAt` from before a Paseo upgrade:** the supervisor is still the old launch (Paseo 0.9's `paseo daemon restart` only replaces the worker). Rerun `install.sh`, or `paseo-codex daemon stop && paseo-codex daemon start`.
 - **Paseo systemd service fails on Paseo 0.9** (`journalctl -u paseo.service`: `--listen was removed`), so the daemon no longer starts at boot: `paseo start --foreground`, `--listen`, `--port`, and the other launch flags were removed (settings live in `config.json`; see `paseo daemon config`). Rerun `install.sh` in a terminal. It adds the drop-in `/etc/systemd/system/<unit>.d/zz-claude-codex.conf` (`~/.config/systemd/user/<unit>.d/` for a user service), which runs `paseo daemon run` instead, turning `--listen` and the relay and web UI flags into the environment overrides it reads, then stops a daemon started by hand and restarts the service (a system service asks for `sudo` first). A flag with no override (`--port`, `--hostnames`, `--no-mcp`) is left for you: change the unit to `paseo daemon run` with that setting in `config.json`, then `systemctl daemon-reload` and restart it (with `--user` for a user service). Delete the drop-in once the unit itself is updated.
+- **Agents have no `paseo` MCP server since Paseo 0.9:** rerun `install.sh`, or `paseo-codex daemon config set daemon.mcp.injectIntoAgents true`. Start a new agent afterwards.
 - **Plugin `failed`:** `paseo-codex plugin logs claude-codex`. Needs Paseo 0.8+.
 - **Tool "denied by the auto mode classifier":** old session or `CLAUDE_CODEX_AUTO_MODE=1`. Start a new agent or change mode.
 - **Empty conversation in Paseo:** transcript is in another profile. Send one message; the launcher moves it and history returns on the next reload.
