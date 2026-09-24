@@ -1075,7 +1075,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual([reply["id"] for reply in replies], [1, 2, 3])
         self.assertEqual(replies[0]["result"]["serverInfo"]["name"], install.plane_mcp.SERVER_NAME)
         self.assertEqual({tool["name"] for tool in replies[1]["result"]["tools"]},
-                         {"list_projects", "list_work_items", "get_work_item"})
+                         {"list_projects", "list_work_items", "get_work_item", "list_pages", "get_page"})
         self.assertNotIn(first_token, protocol.stdout + protocol.stderr)
         token_file = self.base / "rotated-token"
         token_file.write_text(next_token + "\n")
